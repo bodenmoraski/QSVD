@@ -4,311 +4,281 @@ from qiskit import QuantumCircuit
 from qiskit.quantum_info import Operator
 from qiskit.circuit import Parameter
 from qiskit_aer import AerSimulator, UnitarySimulator
-from qiskit_algorithms.optimizers import ADAM
+from qiskit_algorithms.optimizers import SPSA, ADAM
 import matplotlib.pyplot as plt
 from scipy.linalg import svd as classical_svd
 import time
 
-
-def ExponentiallyDecayingLearningRate(lr, itr, decay_rate=0.1):
-    """
-    Calculate the exponentially decaying learning rate.
-    
-    Args:
-        lr (float): Initial learning rate.
-        itr (int): Current iteration number.
-        decay_rate (float): Decay rate for the learning rate.
-        
-    Returns:
-        float: Updated learning rate.
-    """
-    #return lr * np.exp(-decay_rate * itr)
-    return lr * 1.01
-
-# Define quantum neural network
-def U_theta(num_qubits: int, depth: int) -> QuantumCircuit:
-    """
-    Constructs a parameterized quantum circuit with specified number of qubits and depth.
-    Uses CNOT and single-qubit rotations to approximate iSwap gate.
-    
-    Args:
-        num_qubits (int): Number of qubits in the circuit.
-        depth (int): Depth of the circuit.
-        
-    Returns:
-        QuantumCircuit: The constructed quantum circuit.
-    """
-    cir = QuantumCircuit(num_qubits)
-    for d in range(depth):
-        for q in range(num_qubits):
-            theta = Parameter(f'theta_{d}_{q}')
-            phi = Parameter(f'phi_{d}_{q}')
-            cir.ry(theta, q)
-            cir.rz(phi, q)
-        for q in range(num_qubits - 1):
-            cir.cx(q, q + 1)
-            cir.cz(q, q + 1)       # CZ gate for richer entanglement
-            # Approximate iSwap using CNOT and single-qubit rotations
-            cir.h(q)
-            cir.h(q + 1)
-            cir.cx(q, q + 1)
-            cir.rz(np.pi/2, q)
-            cir.rz(np.pi/2, q + 1)
-            cir.cx(q, q + 1)
-            cir.h(q)
-            cir.h(q + 1)
-    return cir
-
 class VQSVD:
-    def __init__(self, matrix: np.ndarray, weights: np.ndarray, num_qubits: int, depth: int, rank: int, lr: float, itr: int):
+    def __init__(self, matrix: np.ndarray, rank: int, num_qubits: int, depth: int, lr: float, itr: int):
+        self.matrix = np.array(matrix)
         self.rank = rank
-        self.initial_lr = lr
-        self.lr = lr
-        self.itr = itr
-        self.current_iteration = 0
-        
-        self.base_depth = depth
-        self.cir_depth = depth
-        
         self.num_qubits = num_qubits
-        self.cir_U = self.create_parameterized_circuit(num_qubits, depth, 'U')
-        self.cir_V = self.create_parameterized_circuit(num_qubits, depth, 'V')
-        
-        self.M = matrix
-        self.weight = weights
-        
-        self.params_dict = {param: 0 for param in self.cir_U.parameters}
-        self.params_dict.update({param: 0 for param in self.cir_V.parameters})
-        
-        self.final_params = None
+        self.circuit_depth = depth
+        self.lr = lr
+        self.max_iters = itr
 
-    def create_parameterized_circuit(self, num_qubits: int, depth: int, prefix: str) -> QuantumCircuit:
-        cir = QuantumCircuit(num_qubits)
-        for d in range(depth):
-            for q in range(num_qubits):
-                theta = Parameter(f'{prefix}_theta_{d}_{q}')
-                phi = Parameter(f'{prefix}_phi_{d}_{q}')
-                cir.ry(theta, q)
-                cir.rz(phi, q)
-            for q in range(num_qubits - 1):
-                cir.cx(q, q + 1)
-                cir.cz(q, q + 1)
-                # Approximate iSwap
-                cir.h(q)
-                cir.h(q + 1)
-                cir.cx(q, q + 1)
-                cir.rz(np.pi/2, q)
-                cir.rz(np.pi/2, q + 1)
-                cir.cx(q, q + 1)
-                cir.h(q)
-                cir.h(q + 1)
-        return cir
+        # Check if matrix size matches number of qubits
+        if self.matrix.shape != (2**num_qubits, 2**num_qubits):
+            raise ValueError(f"Matrix shape {self.matrix.shape} does not match the number of qubits {num_qubits}")
 
-    def increase_circuit_depth(self):
-        self.cir_depth += 1
-        new_layer_U = self.create_parameterized_circuit(self.num_qubits, 1, f'U_{self.cir_depth}')
-        new_layer_V = self.create_parameterized_circuit(self.num_qubits, 1, f'V_{self.cir_depth}')
-        
-        self.cir_U = self.cir_U.compose(new_layer_U)
-        self.cir_V = self.cir_V.compose(new_layer_V)
-        
-        for param in new_layer_U.parameters:
-            self.params_dict[param] = 0
-        for param in new_layer_V.parameters:
-            self.params_dict[param] = 0
+        # Initialize quantum circuits for U and V
+        self.circuit_U = self.create_parameterized_circuit(prefix='U')
+        self.circuit_V = self.create_parameterized_circuit(prefix='V')
 
-    def get_matrix(self, circuit, params):
-        bound_circuit = circuit.assign_parameters({param: value for param, value in params.items() if param in circuit.parameters})
-        
-        # Use UnitarySimulator to compute the unitary
-        backend = UnitarySimulator()
-        job = backend.run(bound_circuit)
-        result = job.result()
-        
-        # Get the unitary from the result
-        unitary = result.get_unitary()
-        
-        return unitary
+        # Initialize parameters
+        self.params_U = np.random.uniform(-np.pi, np.pi, len(self.circuit_U.parameters))
+        self.params_V = np.random.uniform(-np.pi, np.pi, len(self.circuit_V.parameters))
 
-    def loss_func(self, params):
-        #print(f"Number of params: {len(params)}, Number of params_dict: {len(self.params_dict)}")
-        for param, value in zip(self.params_dict.keys(), params):
-            self.params_dict[param] = value
-        
-        #print(f"Number of U parameters: {len(self.cir_U.parameters)}")
-        #print(f"Number of V parameters: {len(self.cir_V.parameters)}")
-        
-        U = self.get_matrix(self.cir_U, self.params_dict)
-        V = self.get_matrix(self.cir_V, self.params_dict)
-        
-        # Convert Operators to numpy arrays
-        U_array = np.asarray(U)
-        V_array = np.asarray(V)
-        
-        # Compute U^† * M * V
-        product = np.conj(U_array.T) @ self.M @ V_array
-        
-        # Extract diagonal elements (singular values)
-        singular_values = np.abs(np.diag(product))
-        
-        # Sort singular values in descending order
-        sorted_singular_values = np.sort(singular_values)[::-1]
-        
+        # Set up simulator
+        self.backend = UnitarySimulator()
+
         # Compute true singular values
-        true_singular_values = np.linalg.svd(self.M, compute_uv=False)[:self.rank]
-        
-        # Compute mean squared error between approximated and true singular values
-        singular_value_error = np.mean((sorted_singular_values[:self.rank] - true_singular_values)**2)
-        
-        # Add penalty for off-diagonal elements
-        off_diagonal_penalty = np.sum(np.abs(product - np.diag(np.diag(product))))
-        
-        # Add regularization term to encourage orthogonality of U and V
-        orthogonality_penalty = np.sum(np.abs(np.eye(U_array.shape[0]) - U_array @ np.conj(U_array.T))) + \
-                                np.sum(np.abs(np.eye(V_array.shape[0]) - V_array @ np.conj(V_array.T)))
-        
-        # Combine all terms
-        total_loss = singular_value_error + 0.1 * off_diagonal_penalty + 0.01 * orthogonality_penalty
-        
-        # No need for exponential transformation if all terms are non-negative
-        return total_loss, sorted_singular_values[:self.rank]
+        self.true_singular_values = classical_svd(self.matrix, compute_uv=False)[:self.rank]
+        print(f"True singular values: {self.true_singular_values}")
 
-    def train(self):
-        loss_list, singular_value_list = [], []
+        # Lists to store loss and singular values over iterations
+        self.loss_history = []
+        self.singular_values_history = []
+
+    def create_parameterized_circuit(self, prefix: str) -> QuantumCircuit:
+        circuit = QuantumCircuit(self.num_qubits)
+        for d in range(self.circuit_depth):
+            for q in range(self.num_qubits):
+                theta = Parameter(f'{prefix}_theta_{d}_{q}')
+                circuit.ry(theta, q)
+            if d < self.circuit_depth - 1:  # No entanglement on last layer
+                for q in range(self.num_qubits - 1):
+                    circuit.cx(q, q + 1)
+        return circuit
+
+    def get_unitary(self, circuit: QuantumCircuit, params: np.ndarray) -> np.ndarray:
+        param_dict = dict(zip(circuit.parameters, params))
+        bound_circuit = circuit.assign_parameters(param_dict)
+        job = self.backend.run(bound_circuit)
+        result = job.result()
+        unitary = result.get_unitary()
+        return np.array(unitary)
+
+    def loss_function(self, params_U: np.ndarray, params_V: np.ndarray) -> float:
+        U = self.get_unitary(self.circuit_U, params_U)
+        V = self.get_unitary(self.circuit_V, params_V)
+        product = np.conj(U.T) @ self.matrix @ V
+        estimated_singular_values = np.sort(np.abs(np.diag(product)))[::-1][:self.rank]
         
-        def objective(params):
-            self.current_iteration += 1
-            self.lr = ExponentiallyDecayingLearningRate(self.initial_lr, self.current_iteration)
-            
-            if self.current_iteration % 50 == 0:
-                self.increase_circuit_depth()
-                print(f"Circuit depth increased to {self.cir_depth} at iteration {self.current_iteration}.")
-                params = np.random.random(len(self.params_dict)) * 2 * np.pi
-            
-            loss, singular_values = self.loss_func(params)
-            
-            # Store the loss and singular values
-            loss_list.append(loss.real)
-            singular_value_list.append(singular_values)
-            
-            # Print progress every 10 iterations
-            if len(loss_list) % 10 == 0:
-                print(f'iter: {len(loss_list)}, loss: {loss.real:.4f}, lr: {self.lr:.6f}')
-                
-            if loss < 1e-6:  # Use a small threshold based on the new loss function
-                print(f'Achieved high accuracy for top {self.rank} singular values')
-                self.final_params = params  # Store the final parameters
-                raise StopIteration
-            
+        # Mean Squared Error between estimated and true singular values
+        mse = np.mean((estimated_singular_values - self.true_singular_values) ** 2)
+        
+        return mse
+
+    def objective(self, params):
+        params_U = params[:len(self.circuit_U.parameters)]
+        params_V = params[len(self.circuit_U.parameters):]
+        return self.loss_function(params_U, params_V)
+
+    def optimize(self):
+        optimizer = ADAM(maxiter=self.max_iters, lr=self.lr) # ADAM takes lr as a parameter, not learning_rate
+        
+        params = np.concatenate([self.params_U, self.params_V])
+        
+        def objective_with_callback(parameters):
+            loss = self.objective(parameters)
+            self.loss_history.append(loss)
+            if len(self.loss_history) % 10 == 0:
+                print(f"Iteration {len(self.loss_history)}, Loss: {loss:.6f}")
+                U = self.get_unitary(self.circuit_U, parameters[:len(self.circuit_U.parameters)])
+                V = self.get_unitary(self.circuit_V, parameters[len(self.circuit_U.parameters):])
+                product = np.conj(U.T) @ self.matrix @ V
+                current_singular_values = np.sort(np.abs(np.diag(product)))[::-1][:self.rank]
+                self.singular_values_history.append(current_singular_values)
+                print(f"Estimated singular values: {current_singular_values}")
+                print(f"True singular values: {self.true_singular_values}")
+                print(f"Relative error: {np.mean(np.abs(current_singular_values - self.true_singular_values) / self.true_singular_values):.6f}")
             return loss
-        
-        initial_params = np.random.random(len(self.params_dict)) * 2 * np.pi
-        
-        try:
-            for _ in range(self.itr):
-                optimizer = ADAM(maxiter=1, lr=self.lr)
-                result = optimizer.minimize(fun=objective, x0=initial_params)
-                initial_params = result.x
-                
-                if result.fun < 0.2:
-                    print('Loss less than 0.2')
-                    self.final_params = result.x
-                    break
-            
-            self.final_params = initial_params
-        except StopIteration:
-            print('Training stopped early due to loss threshold being met.')
-            self.itr = self.current_iteration
-        
-        return loss_list, singular_value_list
 
-    def get_final_matrices(self):
-        if self.final_params is None:
-            raise ValueError("Model hasn't been trained yet.")
-        for param, value in zip(self.params_dict.keys(), self.final_params):
-            self.params_dict[param] = value
-        return self.get_matrix(self.cir_U, self.params_dict), self.get_matrix(self.cir_V, self.params_dict)
+        result = optimizer.minimize(fun=objective_with_callback, x0=params)
+
+        self.params_U = result.x[:len(self.circuit_U.parameters)]
+        self.params_V = result.x[len(self.circuit_U.parameters):]
+        final_loss = result.fun
+
+        return self.params_U, self.params_V, final_loss
+
+    def plot_results(self):
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(self.loss_history)
+        plt.title('Loss History')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.yscale('log')
+
+        plt.subplot(1, 2, 2)
+        singular_values_history = np.array(self.singular_values_history)
+        for i in range(self.rank):
+            plt.plot(singular_values_history[:, i], label=f'SV {i+1}')
+        plt.plot(np.tile(self.true_singular_values, (len(self.singular_values_history), 1)), '--', color='black')
+        plt.title('Singular Values Evolution')
+        plt.xlabel('Iteration')
+        plt.ylabel('Singular Value')
+        plt.legend()
+
+        plt.tight_layout()
+        plt.show()
 
     def compare_with_classical_svd(self):
-        # Measure time for VQSVD
-        start_time = time.time()
-        loss_list, singular_value_list = self.train()
-        vqsvd_time = time.time() - start_time
+        """
+        Compares the VQSVD results with classical SVD.
 
-        # Get final U and V matrices
-        U_learned, V_learned = self.get_final_matrices()
-
-        # Measure time for classical SVD
+        Returns:
+            dict: A dictionary containing comparison metrics.
+        """
+        # Classical SVD
         start_time = time.time()
-        U_classical, s_classical, Vt_classical = classical_svd(self.M)
+        U_classical, s_classical, Vt_classical = classical_svd(self.matrix, full_matrices=False)
         classical_time = time.time() - start_time
 
-        # Compare top 'rank' singular values
-        vqsvd_singular_values = singular_value_list[-1]
+        # VQSVD results
+        training_time, vqsvd_singular_values, final_loss = self.optimize()
+        vqsvd_singular_values = np.array(vqsvd_singular_values)
         classical_singular_values = s_classical[:self.rank]
 
         # Calculate relative error
         relative_error = np.mean(np.abs(vqsvd_singular_values - classical_singular_values) / classical_singular_values)
 
-        # Calculate quantum advantage factor (hypothetical)
-        quantum_advantage = self.calculate_quantum_advantage(len(self.M))
+        # Theoretical Quantum Advantage Factor (Placeholder)
+        quantum_advantage = np.log2(self.matrix.shape[0])  # Example: logarithmic advantage
 
         # Print results
-        print(f"VQSVD Time: {vqsvd_time:.4f} seconds")
+        print(f"VQSVD Training Time: {training_time:.4f} seconds")
         print(f"Classical SVD Time: {classical_time:.4f} seconds")
-        print(f"Relative Error in Singular Values: {relative_error:.4f}")
+        print(f"Final VQSVD Loss: {final_loss:.6f}")
+        print(f"VQSVD Singular Values: {vqsvd_singular_values}")
+        print(f"Classical Singular Values: {classical_singular_values}")
+        print(f"Relative Error in Top {self.rank} Singular Values: {relative_error:.4f}")
         print(f"Theoretical Quantum Advantage Factor: {quantum_advantage:.2f}x")
 
         # Plot comparison
         self.plot_comparison(vqsvd_singular_values, classical_singular_values)
+        self.plot_loss_history()
 
-        return vqsvd_time, classical_time, relative_error, quantum_advantage
+        return {
+            "VQSVD Time": training_time,
+            "Classical SVD Time": classical_time,
+            "Relative Error": relative_error,
+            "Quantum Advantage Factor": quantum_advantage,
+            "VQSVD Singular Values": vqsvd_singular_values,
+            "Classical Singular Values": classical_singular_values,
+            "Final Loss": final_loss
+        }
 
-    def calculate_quantum_advantage(self, matrix_size):
-        # This is a hypothetical calculation and should be adjusted based on theoretical or empirical evidence
-        return np.log2(matrix_size)  # Example: logarithmic advantage
+    def plot_comparison(self, vqsvd_values: np.ndarray, classical_values: np.ndarray):
+        """
+        Plots a comparison of singular values obtained from VQSVD and classical SVD.
 
-    def plot_comparison(self, vqsvd_values, classical_values):
+        Args:
+            vqsvd_values (np.ndarray): Singular values from VQSVD.
+            classical_values (np.ndarray): Singular values from classical SVD.
+        """
+        indices = np.arange(1, self.rank + 1)
+        width = 0.35  # Width of the bars
+
         plt.figure(figsize=(10, 6))
-        plt.bar(range(len(vqsvd_values)), vqsvd_values, alpha=0.5, label='VQSVD', color='blue')
-        plt.bar(range(len(classical_values)), classical_values, alpha=0.5, label='Classical SVD', color='red')
-        plt.xlabel('Index')
-        plt.ylabel('Singular Value')
+        plt.bar(indices - width/2, vqsvd_values, width, label='VQSVD', color='blue')
+        plt.bar(indices + width/2, classical_values, width, label='Classical SVD', color='red')
+
+        plt.xlabel('Singular Value Index')
+        plt.ylabel('Singular Value Magnitude')
         plt.title('VQSVD vs Classical SVD: Top Singular Values')
+        plt.xticks(indices)
         plt.legend()
+        plt.grid(True)
         plt.show()
+
+    def plot_loss_history(self):
+        """
+        Plots the loss history over iterations.
+        """
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(len(self.loss_history)), self.loss_history)
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.title('Loss History')
+        plt.yscale('log')  # Use log scale for y-axis
+        plt.grid(True)
+        plt.show()
+
+    def analyze_circuit_expressiveness(self):
+        num_params = len(self.circuit_U.parameters) + len(self.circuit_V.parameters)
+        matrix_size = self.matrix.size
+        print(f"Number of circuit parameters: {num_params}")
+        print(f"Matrix size: {matrix_size}")
+        print(f"Ratio of parameters to matrix size: {num_params / matrix_size:.4f}")
+    def plot_optimization_landscape(self):
+        num_points = 20  # Reduced for faster computation
+        param_range = np.linspace(-np.pi, np.pi, num_points)
+        loss_landscape = np.zeros((num_points, num_points))
+        for i, p1 in enumerate(param_range):
+            for j, p2 in enumerate(param_range):
+                params = np.array([p1, p2] * (len(self.params_U) // 2 + len(self.params_V) // 2))
+                loss_landscape[i, j] = self.objective(params)
+        plt.figure(figsize=(10, 8))
+        plt.imshow(loss_landscape, extent=[-np.pi, np.pi, -np.pi, np.pi], origin='lower', aspect='auto')
+        plt.colorbar(label='Loss')
+        plt.title('Optimization Landscape')
+        plt.xlabel('Parameter 1')
+        plt.ylabel('Parameter 2')
+        plt.show()
+
+    def check_unitarity(self, params_U, params_V):
+        U = self.get_unitary(self.circuit_U, params_U)
+        V = self.get_unitary(self.circuit_V, params_V)
+        U_unitarity_error = np.linalg.norm(U @ np.conj(U.T) - np.eye(U.shape[0]))
+        V_unitarity_error = np.linalg.norm(V @ np.conj(V.T) - np.eye(V.shape[0]))
+        print(f"U unitarity error: {U_unitarity_error:.6f}")
+        print(f"V unitarity error: {V_unitarity_error:.6f}")
+
+    def initialize_parameters(self, strategy='random'):
+        if strategy == 'random':
+            return np.random.uniform(-np.pi, np.pi, len(self.circuit_U.parameters) + len(self.circuit_V.parameters))
+        elif strategy == 'zero':
+            return np.zeros(len(self.circuit_U.parameters) + len(self.circuit_V.parameters))
+        elif strategy == 'small':
+            return np.random.uniform(-0.1, 0.1, len(self.circuit_U.parameters) + len(self.circuit_V.parameters))
 
 # Hyperparameter settings
 RANK = 8
-ITR = 100
-LR = 0.05
-num_qubits = 3
-cir_depth = 20
+ITR = 500
+LR = 0.01
+NUM_QUBITS = 4
+CIRCUIT_DEPTH = 3
 
-# Generate random matrix and weights
-M = np.random.randint(10, size=(2**num_qubits, 2**num_qubits)) + 1j * np.random.randint(10, size=(2**num_qubits, 2**num_qubits))
-weight = np.arange(3 * RANK, 0, -3).astype('complex128')
+np.random.seed(42)
+M = np.random.randint(1, 10, size=(2**NUM_QUBITS, 2**NUM_QUBITS)) + 1j * np.random.randint(1, 10, size=(2**NUM_QUBITS, 2**NUM_QUBITS))
 
-# Construct the VQSVD network and train
-net = VQSVD(matrix=M, weights=weight, num_qubits=num_qubits, depth=cir_depth, rank=RANK, lr=LR, itr=ITR)
-loss_list, singular_value_list = net.train()
+net = VQSVD(matrix=M, rank=RANK, num_qubits=NUM_QUBITS, depth=CIRCUIT_DEPTH, lr=LR, itr=ITR)
 
-# Get final U and V matrices
-U_learned, V_learned = net.get_final_matrices()
+print("Circuit Expressiveness Analysis:")
+net.analyze_circuit_expressiveness()
 
-plt.figure(figsize=(10, 6))
-plt.plot(loss_list, label='Loss over time')
+print("\nInitial Unitarity Check:")
+net.check_unitarity(net.params_U, net.params_V)
+
+print("\nOptimization Landscape:")
+net.plot_optimization_landscape()
+
+print("\nStarting Optimization:")
+final_params_U, final_params_V, final_loss = net.optimize()
+
+print("\nFinal Unitarity Check:")
+net.check_unitarity(final_params_U, final_params_V)
+
+print("\nFinal Loss Components:")
+net.loss_function(final_params_U, final_params_V)
+
+print("\nLoss History:")
+plt.plot(net.loss_history)
+plt.title('Loss History')
 plt.xlabel('Iteration')
 plt.ylabel('Loss')
-plt.title('Loss vs. Iterations during Training')
-plt.legend()
-plt.grid(True)
 plt.show()
-
-print("Training completed.")
-print(f"Final loss: {loss_list[-1]}")
-print(f"Final singular values: {singular_value_list[-1]}")
-
-# After training the model
-net = VQSVD(matrix=M, weights=weight, num_qubits=num_qubits, depth=cir_depth, rank=RANK, lr=LR, itr=ITR)
-vqsvd_time, classical_time, relative_error, quantum_advantage = net.compare_with_classical_svd()

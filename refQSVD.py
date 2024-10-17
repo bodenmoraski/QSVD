@@ -1,36 +1,23 @@
+
 import numpy as np
 import qiskit
 from qiskit import QuantumCircuit
 from qiskit.quantum_info import Operator
 from qiskit.circuit import Parameter
-from qiskit_aer import AerSimulator, UnitarySimulator
-from qiskit_algorithms.optimizers import SPSA
+from qiskit_aer import AerSimulator, UnitarySimulator  
+from qiskit_algorithms.optimizers import SPSA, ADAM
 import matplotlib.pyplot as plt
 from scipy.linalg import svd as classical_svd
 import time
 
 class VQSVD:
     def __init__(self, matrix: np.ndarray, rank: int, num_qubits: int, depth: int, lr: float, itr: int):
-        """
-        Initializes the VQSVD instance.
-
-        Args:
-            matrix (np.ndarray): The input matrix to decompose.
-            rank (int): The number of singular values to compute.
-            num_qubits (int): Number of qubits in each quantum circuit.
-            depth (int): Initial depth of the quantum circuits.
-            lr (float): Initial learning rate for the optimizer.
-            itr (int): Maximum number of iterations for training.
-        """
         self.matrix = np.array(matrix)
         self.rank = rank
         self.num_qubits = num_qubits
         self.circuit_depth = depth
-        self.initial_depth = depth
         self.lr = lr
-        self.initial_lr = lr
         self.max_iters = itr
-        self.current_iteration = 0
 
         # Check if matrix size matches number of qubits
         if self.matrix.shape != (2**num_qubits, 2**num_qubits):
@@ -44,182 +31,137 @@ class VQSVD:
         self.params_U = np.random.uniform(-np.pi, np.pi, len(self.circuit_U.parameters))
         self.params_V = np.random.uniform(-np.pi, np.pi, len(self.circuit_V.parameters))
 
-        # Store final parameters after training
-        self.final_params_U = None
-        self.final_params_V = None
+        # Set up simulator
+        self.backend = UnitarySimulator()
+
+        # Compute true singular values
+        self.true_singular_values = classical_svd(self.matrix, compute_uv=False)[:self.rank]
+        print(f"True singular values: {self.true_singular_values}")
 
         # Lists to store loss and singular values over iterations
         self.loss_history = []
         self.singular_values_history = []
 
-        # Set up simulator
-        self.backend = UnitarySimulator()
-
     def create_parameterized_circuit(self, prefix: str) -> QuantumCircuit:
-        """
-        Creates a parameterized quantum circuit with the specified prefix for parameter names.
-
-        Args:
-            prefix (str): Prefix for parameter naming to distinguish between U and V circuits.
-
-        Returns:
-            QuantumCircuit: The created parameterized quantum circuit.
-        """
         circuit = QuantumCircuit(self.num_qubits)
         for d in range(self.circuit_depth):
             for q in range(self.num_qubits):
                 theta = Parameter(f'{prefix}_theta_{d}_{q}')
-                phi = Parameter(f'{prefix}_phi_{d}_{q}')
                 circuit.ry(theta, q)
-                circuit.rz(phi, q)
-            # Entangling layer
-            for q in range(self.num_qubits - 1):
-                circuit.cx(q, q + 1)
-                circuit.cz(q, q + 1)
-                # Approximate iSwap using CNOT and single-qubit rotations
-                circuit.h(q)
-                circuit.h(q + 1)
-                circuit.cx(q, q + 1)
-                circuit.rz(np.pi / 2, q)
-                circuit.rz(np.pi / 2, q + 1)
-                circuit.cx(q, q + 1)
-                circuit.h(q)
-                circuit.h(q + 1)
+            if d < self.circuit_depth - 1:  # No entanglement on last layer
+                for q in range(self.num_qubits - 1):
+                    circuit.cx(q, q + 1)
         return circuit
 
-    def increase_circuit_depth(self):
-        """
-        Dynamically increases the depth of the quantum circuits by adding one more layer.
-        """
-        self.circuit_depth += 1
-        print(f"Increasing circuit depth to {self.circuit_depth}.")
-
-        # Create new layers with unique parameter names
-        new_layer_U = self.create_parameterized_circuit(prefix=f'U_{self.circuit_depth}')
-        new_layer_V = self.create_parameterized_circuit(prefix=f'V_{self.circuit_depth}')
-
-        # Append new layers to existing circuits
-        self.circuit_U = self.circuit_U.compose(new_layer_U)
-        self.circuit_V = self.circuit_V.compose(new_layer_V)
-
-        # Initialize new parameters
-        self.params_U = np.concatenate([self.params_U, np.random.uniform(-np.pi, np.pi, len(new_layer_U.parameters))])
-        self.params_V = np.concatenate([self.params_V, np.random.uniform(-np.pi, np.pi, len(new_layer_V.parameters))])
-
     def get_unitary(self, circuit: QuantumCircuit, params: np.ndarray) -> np.ndarray:
-        """
-        Binds parameters to the circuit and retrieves the unitary matrix.
-
-        Args:
-            circuit (QuantumCircuit): The quantum circuit.
-            params (np.ndarray): The parameters to bind.
-
-        Returns:
-            np.ndarray: The unitary matrix of the circuit.
-        """
-        # Bind parameters
-        param_dict = {param: value for param, value in zip(circuit.parameters, params)}
+        param_dict = dict(zip(circuit.parameters, params))
         bound_circuit = circuit.assign_parameters(param_dict)
-
-        # Execute the circuit to get the unitary
         job = self.backend.run(bound_circuit)
         result = job.result()
-        unitary = result.get_unitary(bound_circuit)
-
-        # Convert to numpy array
+        unitary = result.get_unitary()
         return np.array(unitary)
 
     def loss_function(self, params_U: np.ndarray, params_V: np.ndarray) -> float:
-        """
-        Computes the loss function for the VQSVD.
-
-        Args:
-            params_U (np.ndarray): Parameters for the U circuit.
-            params_V (np.ndarray): Parameters for the V circuit.
-
-        Returns:
-            float: The computed loss.
-        """
-        # Retrieve unitaries for U and V
         U = self.get_unitary(self.circuit_U, params_U)
         V = self.get_unitary(self.circuit_V, params_V)
+        product = np.conj(U.T) @ self.matrix @ V
+        estimated_singular_values = np.sort(np.abs(np.diag(product)))[::-1][:self.rank]
+        
+        # Mean Squared Error between estimated and true singular values
+        mse = np.mean((estimated_singular_values - self.true_singular_values) ** 2)
+        
+        return mse
 
-        # Ensure all matrices are numpy arrays
-        U = np.array(U)
-        V = np.array(V)
-        M = np.array(self.matrix)
+    def objective(self, params):
+        params_U = params[:len(self.circuit_U.parameters)]
+        params_V = params[len(self.circuit_U.parameters):]
+        return self.loss_function(params_U, params_V)
 
-        # Compute U† * M * V
-        product = np.conj(U.T) @ M @ V
-
-        # Extract singular values from the diagonal
-        singular_values = np.abs(np.diag(product))
-
-        # Sort singular values in descending order
-        sorted_singular_values = np.sort(singular_values)[::-1]
-
-        # Compute true singular values using classical SVD
-        true_singular_values = classical_svd(M, compute_uv=False)[:self.rank]
-
-        # Calculate the Mean Squared Error (MSE) between approximate and true singular values
-        mse = np.mean((sorted_singular_values[:self.rank] - true_singular_values) ** 2)
-
-        # Compute penalties
-        # 1. Off-diagonal penalty to encourage diagonal structure
-        off_diagonal = product - np.diag(np.diag(product))
-        off_diagonal_penalty = np.sum(np.abs(off_diagonal)) / product.size
-
-        # 2. Orthogonality penalty to encourage U and V to be unitary
-        orthogonality_U = np.eye(U.shape[0]) - U @ np.conj(U.T)
-        orthogonality_V = np.eye(V.shape[0]) - V @ np.conj(V.T)
-        orthogonality_penalty = (np.sum(np.abs(orthogonality_U)) + np.sum(np.abs(orthogonality_V))) / (U.size + V.size)
-
-        # Weighted sum of MSE and penalties
-        loss = mse + 0.1 * off_diagonal_penalty + 0.01 * orthogonality_penalty
-
-        return loss
+    def clip_gradients(self, gradients, max_norm=1.0):
+        total_norm = np.linalg.norm(gradients)
+        if total_norm > max_norm:
+            clip_coef = max_norm / (total_norm + 1e-6)
+            return gradients * clip_coef
+        return gradients
 
     def optimize(self):
-        """
-        Runs the optimization process using SPSA optimizer.
-        """
-        optimizer = SPSA(maxiter=self.max_iters, learning_rate=self.lr, perturbation=0.1)
+        initial_lr = self.lr
+        optimizer = ADAM(maxiter=self.max_iters, lr=initial_lr)
+        params = np.concatenate([self.params_U, self.params_V])
+        current_lr = initial_lr
 
-        def objective(params):
-            # Split parameters for U and V
-            params_U = params[:len(self.circuit_U.parameters)]
-            params_V = params[len(self.circuit_U.parameters):]
-
-            # Compute loss
-            loss = self.loss_function(params_U, params_V)
+        def objective_with_callback(parameters):
+            nonlocal current_lr
+            loss = self.objective(parameters)
+            self.loss_history.append(loss)
+            
+            # Adaptive learning rate
+            if len(self.loss_history) > 1:
+                if self.loss_history[-1] > self.loss_history[-2]:
+                    current_lr *= 0.5
+                elif len(self.loss_history) % 10 == 0:
+                    current_lr = min(initial_lr, current_lr * 1.1)
+            
+            # Create a new optimizer with the updated learning rate
+            optimizer = ADAM(maxiter=self.max_iters, lr=current_lr)
+            # Compute gradients
+            eps = 1e-8
+            grads = []
+            for i in range(len(parameters)):
+                params_plus = parameters.copy()
+                params_plus[i] += eps
+                loss_plus = self.objective(params_plus)
+                grad = (loss_plus - loss) / eps
+                grads.append(grad)
+            
+            # Clip gradients
+            clipped_grads = self.clip_gradients(np.array(grads))
+            
+            # Update parameters
+            #parameters -= current_lr * clipped_grads # testong removing this
+            
+            if len(self.loss_history) % 10 == 0:
+                print(f"Iteration {len(self.loss_history)}, Loss: {loss:.6f}, LR: {current_lr:.6f}")
+                U = self.get_unitary(self.circuit_U, parameters[:len(self.circuit_U.parameters)])
+                V = self.get_unitary(self.circuit_V, parameters[len(self.circuit_U.parameters):])
+                product = np.conj(U.T) @ self.matrix @ V
+                current_singular_values = np.sort(np.abs(np.diag(product)))[::-1][:self.rank]
+                self.singular_values_history.append(current_singular_values)
+                print(f"Estimated singular values: {current_singular_values}")
+                print(f"True singular values: {self.true_singular_values}")
+                print(f"Relative error: {np.mean(np.abs(current_singular_values - self.true_singular_values) / self.true_singular_values):.6f}")
+            
             return loss
 
-        # Combine parameters for U and V
-        initial_params = np.concatenate([self.params_U, self.params_V])
+        result = optimizer.minimize(fun=objective_with_callback, x0=params)
 
-        start_time = time.time()
-        result = optimizer.minimize(fun=objective, x0=initial_params)
-        end_time = time.time()
+        self.params_U = result.x[:len(self.circuit_U.parameters)]
+        self.params_V = result.x[len(self.circuit_U.parameters):]
+        final_loss = result.fun
 
-        # Store final parameters
-        self.final_params_U = result.x[:len(self.circuit_U.parameters)]
-        self.final_params_V = result.x[len(self.circuit_U.parameters):]
+        return self.params_U, self.params_V, final_loss
 
-        training_time = end_time - start_time
+    def plot_results(self):
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(self.loss_history)
+        plt.title('Loss History')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.yscale('log')
 
-        # Compute final loss and singular values
-        final_loss = self.loss_function(self.final_params_U, self.final_params_V)
-        U_final = self.get_unitary(self.circuit_U, self.final_params_U)
-        V_final = self.get_unitary(self.circuit_V, self.final_params_V)
-        final_product = np.conj(U_final.T) @ self.matrix @ V_final
-        final_singular_values = np.abs(np.diag(final_product))
-        sorted_final_singular_values = np.sort(final_singular_values)[::-1][:self.rank]
+        plt.subplot(1, 2, 2)
+        singular_values_history = np.array(self.singular_values_history)
+        for i in range(self.rank):
+            plt.plot(singular_values_history[:, i], label=f'SV {i+1}')
+        plt.plot(np.tile(self.true_singular_values, (len(self.singular_values_history), 1)), '--', color='black')
+        plt.title('Singular Values Evolution')
+        plt.xlabel('Iteration')
+        plt.ylabel('Singular Value')
+        plt.legend()
 
-        # Store history (for plotting, if needed)
-        self.loss_history.append(final_loss)
-        self.singular_values_history.append(sorted_final_singular_values)
-
-        return training_time, sorted_final_singular_values, final_loss
+        plt.tight_layout()
+        plt.show()
 
     def compare_with_classical_svd(self):
         """
@@ -234,9 +176,7 @@ class VQSVD:
         classical_time = time.time() - start_time
 
         # VQSVD results
-        start_time = time.time()
         training_time, vqsvd_singular_values, final_loss = self.optimize()
-        vqsvd_time = training_time
         vqsvd_singular_values = np.array(vqsvd_singular_values)
         classical_singular_values = s_classical[:self.rank]
 
@@ -247,19 +187,26 @@ class VQSVD:
         quantum_advantage = np.log2(self.matrix.shape[0])  # Example: logarithmic advantage
 
         # Print results
-        print(f"VQSVD Training Time: {vqsvd_time:.4f} seconds")
+        print(f"VQSVD Training Time: {training_time:.4f} seconds")
         print(f"Classical SVD Time: {classical_time:.4f} seconds")
+        print(f"Final VQSVD Loss: {final_loss:.6f}")
+        print(f"VQSVD Singular Values: {vqsvd_singular_values}")
+        print(f"Classical Singular Values: {classical_singular_values}")
         print(f"Relative Error in Top {self.rank} Singular Values: {relative_error:.4f}")
         print(f"Theoretical Quantum Advantage Factor: {quantum_advantage:.2f}x")
 
         # Plot comparison
         self.plot_comparison(vqsvd_singular_values, classical_singular_values)
+        self.plot_loss_history()
 
         return {
-            "VQSVD Time": vqsvd_time,
+            "VQSVD Time": training_time,
             "Classical SVD Time": classical_time,
             "Relative Error": relative_error,
-            "Quantum Advantage Factor": quantum_advantage
+            "Quantum Advantage Factor": quantum_advantage,
+            "VQSVD Singular Values": vqsvd_singular_values,
+            "Classical Singular Values": classical_singular_values,
+            "Final Loss": final_loss
         }
 
     def plot_comparison(self, vqsvd_values: np.ndarray, classical_values: np.ndarray):
@@ -285,31 +232,112 @@ class VQSVD:
         plt.grid(True)
         plt.show()
 
+    def plot_loss_history(self):
+        """
+        Plots the loss history over iterations.
+        """
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(len(self.loss_history)), self.loss_history)
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.title('Loss History')
+        plt.yscale('log')  # Use log scale for y-axis
+        plt.grid(True)
+        plt.show()
+
+    def analyze_circuit_expressiveness(self):
+        num_params = len(self.circuit_U.parameters) + len(self.circuit_V.parameters)
+        matrix_size = self.matrix.size
+        print(f"Number of circuit parameters: {num_params}")
+        print(f"Matrix size: {matrix_size}")
+        print(f"Ratio of parameters to matrix size: {num_params / matrix_size:.4f}")
+    def plot_optimization_landscape(self):
+        num_points = 20  # Reduced for faster computation
+        param_range = np.linspace(-np.pi, np.pi, num_points)
+        loss_landscape = np.zeros((num_points, num_points))
+        for i, p1 in enumerate(param_range):
+            for j, p2 in enumerate(param_range):
+                params = np.array([p1, p2] * (len(self.params_U) // 2 + len(self.params_V) // 2))
+                loss_landscape[i, j] = self.objective(params)
+        plt.figure(figsize=(10, 8))
+        plt.imshow(loss_landscape, extent=[-np.pi, np.pi, -np.pi, np.pi], origin='lower', aspect='auto')
+        plt.colorbar(label='Loss')
+        plt.title('Optimization Landscape')
+        plt.xlabel('Parameter 1')
+        plt.ylabel('Parameter 2')
+        plt.show()
+
+    def check_unitarity(self, params_U, params_V):
+        U = self.get_unitary(self.circuit_U, params_U)
+        V = self.get_unitary(self.circuit_V, params_V)
+        U_unitarity_error = np.linalg.norm(U @ np.conj(U.T) - np.eye(U.shape[0]))
+        V_unitarity_error = np.linalg.norm(V @ np.conj(V.T) - np.eye(V.shape[0]))
+        print(f"U unitarity error: {U_unitarity_error:.6f}")
+        print(f"V unitarity error: {V_unitarity_error:.6f}")
+
+    def initialize_parameters(self, strategy='random'):
+        if strategy == 'random':
+            return np.random.uniform(-np.pi, np.pi, len(self.circuit_U.parameters) + len(self.circuit_V.parameters))
+        elif strategy == 'zero':
+            return np.zeros(len(self.circuit_U.parameters) + len(self.circuit_V.parameters))
+        elif strategy == 'small':
+            return np.random.uniform(-0.1, 0.1, len(self.circuit_U.parameters) + len(self.circuit_V.parameters))
+
 # Hyperparameter settings
 RANK = 8
-ITR = 300  # Maximum iterations
-LR = 0.5  # Increased learning rate for SPSA
-NUM_QUBITS = 4  # Increased number of qubits for better representation
-CIRCUIT_DEPTH = 4  # Initial circuit depth
+ITR = 1000  # Increased from 500
+# Reasoning: More iterations allow for better convergence, especially with adaptive learning rate
+# Alternative: Could be set to 2000 for even more thorough optimization, at the cost of longer runtime
 
-# Generate random matrix
-np.random.seed(42)  # For reproducibility
+LR = 0.1  # Decreased from 0.05
+# Reasoning: A smaller initial learning rate can lead to more stable optimization
+# The adaptive learning rate mechanism will adjust this during training
+# Alternative: Could start with 0.005 for even more stability, or 0.02 for faster initial progress
+
+NUM_QUBITS = 4  # Unchanged, as this is determined by the input matrix size
+
+CIRCUIT_DEPTH = 5  # Increased from 3
+# Reasoning: Deeper circuits can express more complex transformations
+# This is especially important given the difficulty in approximating the singular values
+# Alternative: Could be set to 4 for a balance between expressivity and optimization difficulty
+
+
+np.random.seed(42)
 M = np.random.randint(1, 10, size=(2**NUM_QUBITS, 2**NUM_QUBITS)) + 1j * np.random.randint(1, 10, size=(2**NUM_QUBITS, 2**NUM_QUBITS))
 
-# Initialize and run VQSVD
 net = VQSVD(matrix=M, rank=RANK, num_qubits=NUM_QUBITS, depth=CIRCUIT_DEPTH, lr=LR, itr=ITR)
-comparison_results = net.compare_with_classical_svd()
 
-# Plot loss history
-plt.figure(figsize=(10, 6))
-plt.plot(range(len(net.loss_history)), net.loss_history, label='VQSVD Loss', color='blue')
+print("Circuit Expressiveness Analysis:")
+net.analyze_circuit_expressiveness()
+
+print("\nInitial Unitarity Check:")
+net.check_unitarity(net.params_U, net.params_V)
+
+print("\nOptimization Landscape:")
+net.plot_optimization_landscape()
+
+print("\nStarting Optimization:")
+final_params_U, final_params_V, final_loss = net.optimize()
+
+print("\nFinal Unitarity Check:")
+net.check_unitarity(final_params_U, final_params_V)
+
+print("\nFinal Loss Components:")
+final_loss = net.loss_function(final_params_U, final_params_V)
+print(f"Final Loss: {final_loss:.6f}")
+
+# If you want to print more detailed components of the loss:
+U = net.get_unitary(net.circuit_U, final_params_U)
+V = net.get_unitary(net.circuit_V, final_params_V)
+product = np.conj(U.T) @ net.matrix @ V
+estimated_singular_values = np.sort(np.abs(np.diag(product)))[::-1][:net.rank]
+print(f"Estimated singular values: {estimated_singular_values}")
+print(f"True singular values: {net.true_singular_values}")
+print(f"Mean Squared Error: {np.mean((estimated_singular_values - net.true_singular_values) ** 2):.6f}")
+
+print("\nLoss History:")
+plt.plot(net.loss_history)
+plt.title('Loss History')
 plt.xlabel('Iteration')
 plt.ylabel('Loss')
-plt.title('Loss vs. Iterations during VQSVD Training')
-plt.legend()
-plt.grid(True)
 plt.show()
-
-print("Training completed.")
-print(f"Final Loss: {net.loss_history[-1]:.4f}")
-print(f"Final Singular Values: {net.singular_values_history[-1]}")

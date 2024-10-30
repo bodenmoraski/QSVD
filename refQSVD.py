@@ -283,6 +283,8 @@ class VQSVD:
         elif strategy == 'small':
             return np.random.uniform(-0.1, 0.1, len(self.circuit_U.parameters) + len(self.circuit_V.parameters))
 
+"""
+
 # Hyperparameter settings
 RANK = 8
 ITR = 1000  # Increased from 500
@@ -341,3 +343,4 @@ plt.title('Loss History')
 plt.xlabel('Iteration')
 plt.ylabel('Loss')
 plt.show()
+"""

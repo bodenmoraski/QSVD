@@ -26,7 +26,8 @@ from qsvdfuncs import (
     encode_matrix_as_state,
     get_gradient,
     analyze_circuit_expressiveness,
-    run_vqsvd
+    run_vqsvd,
+    apply_noise_to_unitary
 )
 from refQSVD import VQSVD
 from qiskit.quantum_info.operators import Kraus
@@ -70,34 +71,46 @@ class QuantumEnv:
 
     def step(self, action):
         """
-        Applies the action (circuit parameters) to the environment,
-        computes the reward based on QSVD performance, and returns
-        the next state, reward, and done flag.
+        Modified to use energy-based loss function
         """
         # Split action into parameters for U and V circuits
         params_U = action[:len(self.circuit_U.parameters)]
         params_V = action[len(self.circuit_U.parameters):]
         
-        # Calculate the loss as negative reward
-        loss = loss_function(
-            self.matrix, 
-            self.circuit_U, 
-            self.circuit_V, 
-            params_U, 
-            params_V, 
-            rank=self.rank, 
-            noise_model=self.noise_model
-        )
-        reward = -loss  # Minimize loss
+        # Get unitary matrices
+        U = get_unitary(self.circuit_U, params_U)
+        V = get_unitary(self.circuit_V, params_V)
         
-        # Ensure the state is a valid float
-        state = np.array([max(min(loss, 1e6), -1e6)])  # Clip to avoid extreme values
+        if self.noise_model:
+            U = apply_noise_to_unitary(U, self.noise_model)
+            V = apply_noise_to_unitary(V, self.noise_model)
         
-        # Assuming episode ends after each step for simplicity
+        # Calculate energy-based reward
+        energy = 0.0
+        for i in range(self.rank):
+            u_i = U[:, i]
+            v_i = V[:, i]
+            
+            # Energy maximization term
+            energy_term = np.abs(u_i.conj() @ self.matrix @ v_i)
+            
+            # Orthogonality penalty
+            orthogonality_penalty = 0.0
+            for j in range(i):
+                u_j = U[:, j]
+                v_j = V[:, j]
+                orthogonality_penalty += np.abs(u_i.conj() @ u_j)**2 + np.abs(v_i.conj() @ v_j)**2
+            
+            energy += energy_term - orthogonality_penalty
+        
+        # Convert energy to reward (negative loss)
+        reward = energy
+        
+        # State can be a combination of energy and orthogonality
+        state = np.array([energy])  # You might want to include orthogonality in state
+        
         done = True
-        
-        # Optionally, provide additional info
-        info = {}
+        info = {'energy': energy, 'orthogonality_penalty': orthogonality_penalty}
         
         return state, reward, done, info
 
@@ -162,19 +175,19 @@ def train_agent(episodes=100, num_qubits=2, circuit_depth=5, batch_size=10):
     agent = PPOAgent(state_dim, action_dim)
     optimizer = optim.Adam(agent.parameters(), lr=0.0001)  # Reduced learning rate
 
-    # Hyperparameters for PPO
-    gamma = 0.99
-    epsilon = 0.2
-    tau = 0.95
-    value_loss_coef = 0.5
-    entropy_coef = 0.01
+    # Modified hyperparameters for energy-based learning
+    gamma = 0.995  # Increased from 0.99 for better long-term energy optimization
+    epsilon = 0.1   # Decreased from 0.2 for more conservative policy updates
+    value_loss_coef = 0.25  # Decreased from 0.5
+    entropy_coef = 0.02  # Increased from 0.01 for better exploration
     max_grad_norm = 0.5
 
     # Storage for PPO and visualization
     memory = []
     episode_rewards = []
     average_losses = []
-    best_reward = float('-inf')
+    best_energy = float('-inf')
+    energy_history = []
     
     for episode in range(episodes):
         state = env.reset()
@@ -261,27 +274,34 @@ def train_agent(episodes=100, num_qubits=2, circuit_depth=5, batch_size=10):
             print(f"Early stopping: Average loss {avg_loss} < 1e-4")
             break
 
-        # Save best model
-        if episode_reward > best_reward:
-            best_reward = episode_reward
+        # Modified update logic
+        if episode_reward > best_energy:
+            best_energy = episode_reward
             torch.save(agent.state_dict(), 'best_model.pth')
+            print(f"New best energy: {best_energy}")
 
     return agent, episode_rewards, average_losses
 
-def plot_training_progress(episode_rewards, average_losses):
-    plt.figure(figsize=(12, 5))
+def plot_training_progress(episode_rewards, average_losses, energy_history):
+    plt.figure(figsize=(15, 5))
     
-    plt.subplot(1, 2, 1)
+    plt.subplot(1, 3, 1)
     plt.plot(episode_rewards)
     plt.title('Episode Rewards')
     plt.xlabel('Episode')
     plt.ylabel('Reward')
     
-    plt.subplot(1, 2, 2)
+    plt.subplot(1, 3, 2)
     plt.plot(average_losses)
     plt.title('Average Losses')
     plt.xlabel('Episode')
     plt.ylabel('Loss')
+    
+    plt.subplot(1, 3, 3)
+    plt.plot(energy_history)
+    plt.title('Energy History')
+    plt.xlabel('Episode')
+    plt.ylabel('Energy')
     
     plt.tight_layout()
     plt.savefig('training_progress.png')
@@ -413,7 +433,7 @@ if __name__ == "__main__":
     plt.close()
 
     # Plot training progress
-    plot_training_progress(episode_rewards, average_losses)
+    plot_training_progress(episode_rewards, average_losses, energy_history)
 
     # Analyze final circuit
     plot_final_circuit_analysis(env, agent)

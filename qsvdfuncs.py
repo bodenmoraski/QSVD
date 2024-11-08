@@ -9,6 +9,8 @@ from qiskit_algorithms.optimizers import SPSA, ADAM
 import matplotlib.pyplot as plt
 from scipy.linalg import svd as classical_svd
 import time
+from qiskit.quantum_info import Operator
+from qiskit.exceptions import QiskitError
 
 
 def create_parameterized_circuit(num_qubits: int, circuit_depth: int, prefix: str) -> QuantumCircuit:
@@ -17,28 +19,18 @@ def create_parameterized_circuit(num_qubits: int, circuit_depth: int, prefix: st
     Incorporates rotation gates, entangling gates, and SWAP gates for expressiveness.
     """
     circuit = QuantumCircuit(num_qubits)
-    for d in range(circuit_depth):
+    
+    # Reduce parameters dramatically
+    for layer in range(min(circuit_depth, 2)):
+        # Single rotation per qubit per layer
         for q in range(num_qubits):
-            theta_x = Parameter(f'{prefix}_theta_x_{d}_{q}')
-            theta_y = Parameter(f'{prefix}_theta_y_{d}_{q}')
-            theta_z = Parameter(f'{prefix}_theta_z_{d}_{q}')
-            circuit.rx(theta_x, q)
-            circuit.ry(theta_y, q)
-            circuit.rz(theta_z, q)
+            theta = Parameter(f'{prefix}_theta_{layer}_{q}')
+            circuit.ry(theta, q)
         
-        if d < circuit_depth - 1:  # No entanglement on last layer
+        # Entangling layer
+        if layer < circuit_depth - 1:
             for q in range(num_qubits - 1):
                 circuit.cx(q, q + 1)
-            for q in range(num_qubits - 2, -1, -1):
-                circuit.cx(q, q + 1)
-            
-            for q in range(num_qubits):
-                phi = Parameter(f'{prefix}_phi_{d}_{q}')
-                circuit.p(phi, q)  # Phase gate
-            
-        if d % 2 == 0 and d < circuit_depth - 1:
-            for q in range(0, num_qubits - 1, 2):
-                circuit.swap(q, q + 1)
     
     return circuit
 
@@ -71,8 +63,10 @@ def loss_function(matrix: np.ndarray, circuit_U: QuantumCircuit, circuit_V: Quan
                   params_U: np.ndarray, params_V: np.ndarray, rank: int, 
                   noise_model: NoiseModel = None) -> float:
     """
-    Computes the relative error between the estimated singular values from the quantum circuits
-    and the true singular values of the input matrix.
+    Computes quantum-native loss based on three principles:
+    1. Maximizing singular values (energy maximization)
+    2. Maintaining orthogonality
+    3. Preserving matrix properties (trace norm, Frobenius norm)
     """
     U = get_unitary(circuit_U, params_U)
     V = get_unitary(circuit_V, params_V)
@@ -81,19 +75,45 @@ def loss_function(matrix: np.ndarray, circuit_U: QuantumCircuit, circuit_V: Quan
         U = apply_noise_to_unitary(U, noise_model)
         V = apply_noise_to_unitary(V, noise_model)
     
-    product = np.conj(U.T) @ matrix @ V
+    loss = 0.0
+    M = matrix
     
-    # Perform SVD on the product
-    _, singular_values_estimated, _ = classical_svd(product)
-    estimated_singular_values = singular_values_estimated[:rank]
+    # 1. Energy Maximization Term
+    energy_terms = []
+    for i in range(rank):
+        u_i = U[:, i]
+        v_i = V[:, i]
+        energy = np.abs(u_i.conj() @ M @ v_i)
+        energy_terms.append(energy)
     
-    # Compute true singular values
-    true_singular_values = classical_svd(matrix, compute_uv=False)[:rank]
+    # Sort energy terms to encourage proper ordering of singular values
+    energy_terms.sort(reverse=True)
+    energy_loss = -sum(energy_terms[i] * (rank - i) for i in range(rank))
     
-    # Compute relative error
-    relative_error = np.mean(np.abs(estimated_singular_values - true_singular_values) / (true_singular_values + 1e-8))
+    # 2. Orthogonality Terms
+    ortho_loss_U = 0.0
+    ortho_loss_V = 0.0
+    for i in range(rank):
+        for j in range(i):
+            ortho_loss_U += np.abs(U[:, i].conj() @ U[:, j])**2
+            ortho_loss_V += np.abs(V[:, i].conj() @ V[:, j])**2
     
-    return relative_error
+    # 3. Matrix Property Preservation
+    # Compute difference between input and reconstructed matrix properties
+    reconstructed = U @ np.diag(energy_terms) @ V.conj().T
+    trace_diff = np.abs(np.trace(M) - np.trace(reconstructed))
+    frob_diff = np.abs(np.linalg.norm(M, 'fro') - np.linalg.norm(reconstructed, 'fro'))
+    
+    # Weighted combination of all terms
+    alpha = 1.0  # Energy weight
+    beta = 2.0   # Orthogonality weight
+    gamma = 0.5  # Property preservation weight
+    
+    total_loss = (alpha * energy_loss + 
+                  beta * (ortho_loss_U + ortho_loss_V) +
+                  gamma * (trace_diff + frob_diff))
+    
+    return total_loss
 
 
 def objective(params: np.ndarray, matrix: np.ndarray, circuit_U: QuantumCircuit, 
@@ -109,44 +129,27 @@ def objective(params: np.ndarray, matrix: np.ndarray, circuit_U: QuantumCircuit,
 def optimize_vqsvd(matrix: np.ndarray, rank: int, num_qubits: int, circuit_depth: int, 
                    lr: float, max_iters: int, noise_model: NoiseModel = None) -> tuple:
     """
-    Optimizes the parameters of the quantum circuits U and V to minimize the QSVD loss.
-    Utilizes the ADAM optimizer for parameter updates.
+    Actually perform quantum SVD using variational circuits
     """
+    # Initialize quantum circuits for U and V
     circuit_U = create_parameterized_circuit(num_qubits, circuit_depth, 'U')
     circuit_V = create_parameterized_circuit(num_qubits, circuit_depth, 'V')
     
-    params_U = np.random.uniform(-np.pi, np.pi, len(circuit_U.parameters))
-    params_V = np.random.uniform(-np.pi, np.pi, len(circuit_V.parameters))
-    params = np.concatenate([params_U, params_V])
+    # Initialize parameters randomly
+    params = initialize_random_parameters(circuit_U, circuit_V)
     
-    optimizer = ADAM(maxiter=max_iters, lr=lr)
+    # Optimize using quantum measurements and classical feedback
+    for iter in range(max_iters):
+        # Measure quantum expectation values
+        expectation = measure_quantum_expectation(circuit_U, circuit_V, params, matrix)
+        
+        # Update parameters using gradient descent
+        params = update_parameters(params, expectation, lr)
+        
+        # Calculate current singular values from quantum state
+        singular_values = extract_singular_values(circuit_U, circuit_V, params)
     
-    loss_history = []
-    singular_values_history = []
-    
-    def objective_with_callback(parameters):
-        loss = objective(parameters, matrix, circuit_U, circuit_V, rank, noise_model=noise_model)
-        loss_history.append(loss)
-        if len(loss_history) % 10 == 0:
-            print(f"Iteration {len(loss_history)}, Loss: {loss:.6f}")
-            U = get_unitary(circuit_U, parameters[:len(circuit_U.parameters)])
-            V = get_unitary(circuit_V, parameters[len(circuit_U.parameters):])
-            product = np.conj(U.T) @ matrix @ V
-            _, singular_values_estimated, _ = classical_svd(product)
-            current_singular_values = singular_values_estimated[:rank]
-            singular_values_history.append(current_singular_values)
-            true_singular_values = classical_svd(matrix, compute_uv=False)[:rank]
-            print(f"Estimated singular values: {current_singular_values}")
-            print(f"True singular values: {true_singular_values}")
-        return loss
-    
-    result = optimizer.minimize(fun=objective_with_callback, x0=params)
-    
-    final_params_U = result.x[:len(circuit_U.parameters)]
-    final_params_V = result.x[len(circuit_U.parameters):]
-    final_loss = result.fun
-    
-    return final_params_U, final_params_V, final_loss, loss_history, singular_values_history
+    return final_params, singular_values
 
 
 def plot_results(loss_history: list, singular_values_history: list, true_singular_values: np.ndarray):
@@ -179,29 +182,6 @@ def plot_results(loss_history: list, singular_values_history: list, true_singula
     plt.show()
 
 
-def compare_with_classical_svd(matrix: np.ndarray, vqsvd_singular_values: np.ndarray, 
-                               training_time: float, rank: int) -> dict:
-    """
-    Compares the QSVD results with classical SVD in terms of time and accuracy.
-    """
-    start_time = time.time()
-    _, s_classical, _ = classical_svd(matrix, full_matrices=False)
-    classical_time = time.time() - start_time
-
-    classical_singular_values = s_classical[:rank]
-    relative_error = np.mean(np.abs(vqsvd_singular_values - classical_singular_values) / (classical_singular_values + 1e-8))
-    quantum_advantage = np.log2(matrix.shape[0])
-
-    return {
-        "VQSVD Time": training_time,
-        "Classical SVD Time": classical_time,
-        "Relative Error": relative_error,
-        "Quantum Advantage Factor": quantum_advantage,
-        "VQSVD Singular Values": vqsvd_singular_values,
-        "Classical Singular Values": classical_singular_values
-    }
-
-
 def plot_singular_value_error(singular_values_history, true_singular_values):
     """
     Plots the error in singular value approximation over iterations.
@@ -221,27 +201,88 @@ def plot_singular_value_error(singular_values_history, true_singular_values):
 
 
 def run_vqsvd(matrix: np.ndarray, rank: int, num_qubits: int, circuit_depth: int, 
-              lr: float, max_iters: int, noise_model: NoiseModel = None) -> dict:
+             lr: float, max_iters: int, noise_model: NoiseModel = None) -> dict:
     """
     Executes the entire QSVD process: optimization, plotting, and comparison.
+
+    Args:
+        matrix (np.ndarray): The matrix to decompose.
+        rank (int): Number of singular values/components.
+        num_qubits (int): Number of qubits.
+        circuit_depth (int): Depth of the quantum circuits.
+        lr (float): Learning rate.
+        max_iters (int): Maximum number of iterations.
+        noise_model (NoiseModel, optional): Noise model to apply. Defaults to None.
+
+    Returns:
+        dict: Dictionary containing comparison metrics and optimization history.
     """
+    import time
+    
+    # Initialize quantum circuits for U and V
+    circuit_U = create_parameterized_circuit(num_qubits, circuit_depth, 'U')
+    circuit_V = create_parameterized_circuit(num_qubits, circuit_depth, 'V')
+    
+    # Initialize parameters randomly
+    params = initialize_random_parameters(circuit_U, circuit_V)
+    
+    # Initialize backend
+    backend = AerSimulator(method='statevector')
+    
+    loss_history = []
+    singular_values_history = []
+    
     start_time = time.time()
-    final_params_U, final_params_V, final_loss, loss_history, singular_values_history = optimize_vqsvd(
-        matrix, rank, num_qubits, circuit_depth, lr, max_iters, noise_model=noise_model
-    )
+    
+    # Add adaptive learning rate
+    initial_lr = lr
+    
+    for iter in range(max_iters):
+        # Compute loss and gradients
+        current_loss = loss_function(matrix, circuit_U, circuit_V, 
+                                   params[:len(circuit_U.parameters)],
+                                   params[len(circuit_U.parameters):],
+                                   rank, noise_model)
+        
+        # Compute gradients using parameter shift
+        gradients = compute_gradients(circuit_U, circuit_V, params, matrix, rank)
+        
+        # Adaptive learning rate
+        lr = initial_lr / (1 + iter/100)
+        
+        # Update parameters with gradient clipping
+        grad_norm = np.linalg.norm(gradients)
+        if grad_norm > 1.0:
+            gradients = gradients / grad_norm
+        params = params - lr * gradients
+        
+        # Extract current singular values
+        singular_values = extract_singular_values(circuit_U, circuit_V, params, matrix)
+        
+        # Store history
+        loss_history.append(current_loss)
+        singular_values_history.append(singular_values)
+        
+        # Early stopping check
+        if len(loss_history) > 10:
+            if np.abs(loss_history[-1] - loss_history[-10]) < 1e-6:
+                print("Converged!")
+                break
+        
+        if iter % 10 == 0:
+            print(f"Iteration {iter}: Loss = {current_loss:.6f}")
+            print(f"Singular Values: {singular_values}")
+    
     training_time = time.time() - start_time
-
-    true_singular_values = classical_svd(matrix, compute_uv=False)[:rank]
-    vqsvd_singular_values = singular_values_history[-1]
-
-    plot_results(loss_history, singular_values_history, true_singular_values)
-    plot_singular_value_error(singular_values_history, true_singular_values)  # New plot
-
-    comparison = compare_with_classical_svd(matrix, vqsvd_singular_values, training_time, rank)
-    comparison["Final Loss"] = final_loss
+    
+    # Extract final singular values
+    final_singular_values = singular_values_history[-1]
+    
+    # Compare with classical SVD
+    comparison = compare_with_classical_svd(matrix, final_singular_values, training_time, rank)
     comparison["Loss History"] = loss_history
     comparison["Singular Values History"] = singular_values_history
-
+    
     return comparison
 
 
@@ -289,17 +330,6 @@ def plot_optimization_landscape(matrix: np.ndarray, circuit_U: QuantumCircuit, c
     plt.show()
 
 
-def qsvd_decompose(operator: np.ndarray) -> tuple:
-    """
-    Placeholder for QSVD decomposition of a quantum operator.
-    Returns identity matrices as placeholders.
-    """
-    Q = np.identity(operator.shape[0])
-    Sigma = np.diag(np.ones(operator.shape[0]))
-    V_dagger = Q.T
-    return Q, Sigma, V_dagger
-
-
 def apply_qsvd_and_calibrate(circuit: QuantumCircuit, operator: np.ndarray) -> QuantumCircuit:
     """
     Decomposes the circuit's unitary operator using QSVD and applies calibration adjustments.
@@ -345,6 +375,189 @@ def get_gradient(circuit: QuantumCircuit, params: np.ndarray, matrix: np.ndarray
         gradients[i] = (loss_up - loss_down) / 2.0
     
     return gradients
+
+
+def initialize_random_parameters(circuit_U: QuantumCircuit, circuit_V: QuantumCircuit) -> np.ndarray:
+    """
+    Initialize the parameters for the quantum circuits U and V randomly.
+
+    Args:
+        circuit_U (QuantumCircuit): Quantum circuit for U.
+        circuit_V (QuantumCircuit): Quantum circuit for V.
+
+    Returns:
+        np.ndarray: Array of initialized parameters, concatenated for U and V.
+    """
+    params_U = np.random.uniform(-np.pi, np.pi, len(circuit_U.parameters))
+    params_V = np.random.uniform(-np.pi, np.pi, len(circuit_V.parameters))
+    return np.concatenate([params_U, params_V])
+
+
+def measure_quantum_expectation(circuit_U: QuantumCircuit, circuit_V: QuantumCircuit, 
+                               params: np.ndarray, matrix: np.ndarray, backend: AerSimulator, noise_model: NoiseModel = None) -> float:
+    """
+    Measures the expectation value of the loss function for the current parameters.
+
+    Args:
+        circuit_U (QuantumCircuit): Quantum circuit for U.
+        circuit_V (QuantumCircuit): Quantum circuit for V.
+        params (np.ndarray): Array of parameters for U and V circuits.
+        matrix (np.ndarray): The matrix to decompose.
+        backend (AerSimulator): Qiskit Aer simulator backend.
+        noise_model (NoiseModel, optional): Noise model to apply. Defaults to None.
+
+    Returns:
+        float: The measured expectation value.
+    """
+    # Split parameters for U and V
+    num_params_U = len(circuit_U.parameters)
+    params_U = params[:num_params_U]
+    params_V = params[num_params_U:]
+    
+    # Bind parameters to circuits
+    binding_U = {param: value for param, value in zip(circuit_U.parameters, params_U)}
+    binding_V = {param: value for param, value in zip(circuit_V.parameters, params_V)}
+    
+    bound_circuit_U = circuit_U.assign_parameters(binding_U)
+    bound_circuit_V = circuit_V.assign_parameters(binding_V)
+    
+    # Combine U and V into a single circuit
+    combined_circuit = bound_circuit_U.compose(bound_circuit_V)
+    
+    # Measure the combined circuit
+    combined_circuit.save_statevector()
+    
+    # Execute the circuit
+    job = backend.run(combined_circuit, noise_model=noise_model)
+    result = job.result()
+    
+    try:
+        state = result.get_statevector()
+    except QiskitError:
+        print("Failed to retrieve statevector.")
+        return float('inf')
+    
+    # Compute U * M * V†
+    U = Operator(bound_circuit_U).data
+    V = Operator(bound_circuit_V).data
+    decomposed_matrix = U @ matrix @ V.conj().T
+    
+    # The expectation value could be the trace of decomposed_matrix
+    expectation = np.abs(np.trace(decomposed_matrix))
+    return expectation
+
+
+def update_parameters(params: np.ndarray, gradients: np.ndarray, lr: float) -> np.ndarray:
+    """
+    Updates the parameters using gradient descent.
+
+    Args:
+        params (np.ndarray): Current parameters.
+        gradients (np.ndarray): Gradients of the loss with respect to parameters.
+        lr (float): Learning rate.
+
+    Returns:
+        np.ndarray: Updated parameters.
+    """
+    return params - lr * gradients
+
+
+def extract_singular_values(circuit_U: QuantumCircuit, circuit_V: QuantumCircuit, 
+                           params: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """
+    Extracts singular values from the quantum circuits U and V with given parameters.
+
+    Args:
+        circuit_U (QuantumCircuit): Quantum circuit for U.
+        circuit_V (QuantumCircuit): Quantum circuit for V.
+        params (np.ndarray): Array of parameters for U and V circuits.
+        matrix (np.ndarray): The matrix to decompose.
+
+    Returns:
+        np.ndarray: Array of singular values.
+    """
+    # Split parameters for U and V
+    num_params_U = len(circuit_U.parameters)
+    params_U = params[:num_params_U]
+    params_V = params[num_params_U:]
+    
+    # Bind parameters to circuits
+    binding_U = {param: value for param, value in zip(circuit_U.parameters, params_U)}
+    binding_V = {param: value for param, value in zip(circuit_V.parameters, params_V)}
+    
+    bound_circuit_U = circuit_U.assign_parameters(binding_U)
+    bound_circuit_V = circuit_V.assign_parameters(binding_V)
+    
+    # Obtain unitary matrices
+    U = Operator(bound_circuit_U).data
+    V = Operator(bound_circuit_V).data
+    
+    # Compute U * M * V†
+    decomposed_matrix = U @ matrix @ V.conj().T
+    
+    # Singular values are the absolute values of the diagonal elements in the ideal case
+    singular_values = np.abs(np.diag(decomposed_matrix))
+    
+    return singular_values
+
+
+def compare_with_classical_svd(matrix: np.ndarray, quantum_singular_values: np.ndarray, training_time: float, rank: int) -> dict:
+    """
+    Compares the quantum SVD results with classical SVD.
+
+    Args:
+        matrix (np.ndarray): Original matrix to decompose.
+        quantum_singular_values (np.ndarray): Singular values obtained from QSVD.
+        training_time (float): Time taken for the QSVD training.
+        rank (int): Number of singular values/components to compare.
+
+    Returns:
+        dict: Dictionary containing comparison metrics.
+    """
+    # Perform classical SVD
+    _, classical_singular_values, _ = classical_svd(matrix, full_matrices=False)
+    classical_singular_values = classical_singular_values[:rank]
+    
+    # Normalize singular values for comparison
+    quantum_singular_values_sorted = np.sort(quantum_singular_values)[::-1]
+    classical_singular_values_sorted = np.sort(classical_singular_values)[::-1]
+    
+    # Compute accuracy metrics
+    accuracy = np.mean(np.isclose(quantum_singular_values_sorted, classical_singular_values_sorted, atol=1e-2))
+    difference = np.linalg.norm(quantum_singular_values_sorted - classical_singular_values_sorted)
+    
+    comparison = {
+        "Classical Singular Values": classical_singular_values_sorted,
+        "Quantum Singular Values": quantum_singular_values_sorted,
+        "Accuracy": accuracy,
+        "Difference": difference,
+        "Training Time (s)": training_time
+    }
+    
+    return comparison
+
+
+def compute_gradients(circuit, params, matrix):
+    gradients = []
+    shift = np.pi/2
+    
+    for i in range(len(params)):
+        # Shift parameter in positive direction
+        params_plus = params.copy()
+        params_plus[i] += shift
+        
+        # Shift parameter in negative direction
+        params_minus = params.copy()
+        params_minus[i] -= shift
+        
+        # Compute gradient using parameter-shift rule
+        expectation_plus = measure_quantum_expectation(circuit, params_plus, matrix)
+        expectation_minus = measure_quantum_expectation(circuit, params_minus, matrix)
+        gradient = (expectation_plus - expectation_minus) / (2 * np.sin(shift))
+        
+        gradients.append(gradient)
+    
+    return np.array(gradients)
 
 
 

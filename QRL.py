@@ -11,21 +11,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # Add this line
-import torch.optim as optim
+import torch.optim as optimfb
 import matplotlib.pyplot as plt
 from qiskit_aer.noise import NoiseModel, thermal_relaxation_error
 from qiskit_aer import AerSimulator
 from qsvdfuncs import (
     create_parameterized_circuit, 
     get_unitary, 
-    loss_function, 
-    objective, 
-    optimize_vqsvd, 
-    plot_results, 
-    compare_with_classical_svd,
-    encode_matrix_as_state,
-    get_gradient,
-    analyze_circuit_expressiveness,
     run_vqsvd,
     apply_noise_to_unitary
 )
@@ -163,17 +155,17 @@ class PPOAgent(nn.Module):
 # =====================================================================
 # 5. Main Training Loop: Agent-Environment Interaction
 # =====================================================================
-def train_agent(episodes=100, num_qubits=2, circuit_depth=5, batch_size=10):
+def train_agent(episodes=1000):
     """
     Trains the PPO agent to adaptively control quantum gates.
     Collects experiences over a batch of episodes before performing updates.
     """
-    env = QuantumEnv(num_qubits, circuit_depth)
+    env = QuantumEnv(num_qubits=2, circuit_depth=5)
     state_dim = 1  # We're using a 1D state now
     action_dim = len(env.circuit_U.parameters) + len(env.circuit_V.parameters)
     
     agent = PPOAgent(state_dim, action_dim)
-    optimizer = optim.Adam(agent.parameters(), lr=0.0001)  # Reduced learning rate
+    optimizer = optimfb.Adam(agent.parameters(), lr=0.0001)  # Reduced learning rate
 
     # Modified hyperparameters for energy-based learning
     gamma = 0.995  # Increased from 0.99 for better long-term energy optimization
@@ -186,8 +178,8 @@ def train_agent(episodes=100, num_qubits=2, circuit_depth=5, batch_size=10):
     memory = []
     episode_rewards = []
     average_losses = []
-    best_energy = float('-inf')
     energy_history = []
+    best_energy = float('-inf')
     
     for episode in range(episodes):
         state = env.reset()
@@ -208,11 +200,14 @@ def train_agent(episodes=100, num_qubits=2, circuit_depth=5, batch_size=10):
         episode_rewards.append(episode_reward)
         
         # Perform PPO update every 'batch_size' episodes
-        if (episode + 1) % batch_size == 0 and len(memory) > 0:
+        if (episode + 1) % 10 == 0 and len(memory) > 0:
             states, actions, old_log_probs, rewards, next_states, dones = zip(*memory)
             
-            # Convert to tensors
+            # Convert states to numpy array first
+            states = np.array(states)
             states = torch.FloatTensor(states)
+            
+            
             actions = torch.FloatTensor(actions)
             old_log_probs = torch.FloatTensor(old_log_probs)
             rewards = torch.FloatTensor(rewards)
@@ -267,8 +262,8 @@ def train_agent(episodes=100, num_qubits=2, circuit_depth=5, batch_size=10):
         if len(episode_rewards) >= 10:
             avg_reward = np.mean(episode_rewards[-10:])
             if avg_reward > 0.95:
-                print(f"Early stopping: Average reward {avg_reward} > 0.95")
-                break
+                print(f"not Early stopping: Average reward {avg_reward} > 0.95")
+                # break
 
         if avg_loss is not None and avg_loss < 1e-4:
             print(f"Early stopping: Average loss {avg_loss} < 1e-4")
@@ -280,7 +275,10 @@ def train_agent(episodes=100, num_qubits=2, circuit_depth=5, batch_size=10):
             torch.save(agent.state_dict(), 'best_model.pth')
             print(f"New best energy: {best_energy}")
 
-    return agent, episode_rewards, average_losses
+        # Store energy history
+        energy_history.append(info['energy'])
+
+    return agent, episode_rewards, average_losses, energy_history
 
 def plot_training_progress(episode_rewards, average_losses, energy_history):
     plt.figure(figsize=(15, 5))
@@ -379,7 +377,7 @@ if __name__ == "__main__":
     Entry point for the program. This is where the training process begins.
     """
     print("Starting training...")
-    agent, episode_rewards, average_losses = train_agent(episodes=100, num_qubits=2, circuit_depth=5, batch_size=10)
+    agent, episode_rewards, average_losses, energy_history = train_agent(episodes=1000)
     print("Training complete.")
     
     # Create an instance of QuantumEnv
@@ -389,7 +387,7 @@ if __name__ == "__main__":
     NUM_QUBITS = 2
     CIRCUIT_DEPTH = 5
     RANK = 2**NUM_QUBITS
-    LR = 0.001
+    LR = 0.1
     MAX_ITERS = 100
 
     # Generate a random matrix
@@ -432,7 +430,7 @@ if __name__ == "__main__":
     plt.savefig('singular_value_comparison.png')
     plt.close()
 
-    # Plot training progress
+    # Plot training progress with energy history
     plot_training_progress(episode_rewards, average_losses, energy_history)
 
     # Analyze final circuit

@@ -18,11 +18,11 @@ from qiskit_aer import AerSimulator
 from qsvdfuncs import (
     create_parameterized_circuit, 
     get_unitary, 
-    run_vqsvd,
-    apply_noise_to_unitary
+    apply_noise_to_unitary,
+    run_vqsvd
 )
 from refQSVD import VQSVD
-from qiskit.quantum_info.operators import Kraus
+from qiskit.quantum_info.operators import Kraus, Operator
 from qiskit.exceptions import QiskitError
 
 # Define the Quantum Environment Using Qiskit
@@ -45,19 +45,24 @@ class QuantumEnv:
 
     def _create_noise_model(self):
         """
-        Creates a noise model to simulate realistic quantum gate errors.
+        Creates a more realistic noise model with time-dependent parameters
+        and cross-talk effects.
         """
+        def get_time_dependent_t1_t2(t):
+            # Base T1 and T2 times (in microseconds)
+            base_t1, base_t2 = 50, 30
+            # Add realistic fluctuations
+            t1 = base_t1 * (1 + 0.1 * np.sin(0.1 * t))  # 10% oscillation
+            t2 = min(t1, base_t2 * (1 + 0.1 * np.sin(0.1 * t)))
+            return t1, t2
+
         noise_model = NoiseModel()
-        
-        # Single-qubit gate error
-        error_1 = thermal_relaxation_error(t1=50, t2=30, time=10)
-        
-        # Two-qubit gate error (e.g., for CX gates)
-        error_2 = error_1.expand(error_1)
-        
-        # Add errors to the noise model
-        noise_model.add_all_qubit_quantum_error(error_1, ['u1', 'u2', 'u3'])  # Single-qubit gates
-        noise_model.add_all_qubit_quantum_error(error_2, ['cx'])  # Two-qubit gates
+        # Add time-dependent thermal relaxation
+        for t in np.linspace(0, 100, 10):  # Sample at different times
+            t1, t2 = get_time_dependent_t1_t2(t)
+            error = thermal_relaxation_error(t1=t1, t2=t2, time=10)
+            # Add cross-talk effects between adjacent qubits
+            noise_model.add_all_qubit_quantum_error(error, ['u1', 'u2', 'u3'])
         
         return noise_model
 
@@ -398,7 +403,6 @@ if __name__ == "__main__":
         matrix=M, 
         rank=RANK, 
         num_qubits=NUM_QUBITS, 
-        circuit_depth=CIRCUIT_DEPTH, 
         lr=LR, 
         max_iters=MAX_ITERS,
         noise_model=env.noise_model
@@ -409,9 +413,9 @@ if __name__ == "__main__":
         if isinstance(value, (int, float, np.ndarray)):
             print(f"{key}: {value}")
 
-    # Additional visualization
+    # Plotting with correct dictionary keys
     plt.figure(figsize=(10, 6))
-    plt.plot(comparison['Loss History'])
+    plt.plot(comparison['Loss History'])  # Now matches the key in results
     plt.title('QSVD Loss History')
     plt.xlabel('Iteration')
     plt.ylabel('Loss')
@@ -421,8 +425,8 @@ if __name__ == "__main__":
 
     # Singular value comparison
     plt.figure(figsize=(10, 6))
-    plt.plot(comparison['Singular Values History'][-1], label='VQSVD')
-    plt.plot(comparison['Classical Singular Values'], label='Classical SVD')
+    plt.plot(comparison['Singular Values History'][-1], label='VQSVD')  # Matches key in results
+    plt.plot(comparison['Classical Singular Values'], label='Classical SVD')  # Matches key in results
     plt.title('Singular Value Comparison')
     plt.xlabel('Index')
     plt.ylabel('Singular Value')

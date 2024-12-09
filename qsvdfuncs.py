@@ -61,12 +61,9 @@ def apply_noise_to_unitary(unitary: np.ndarray, noise_model: NoiseModel) -> np.n
 
 def loss_function(matrix: np.ndarray, circuit_U: QuantumCircuit, circuit_V: QuantumCircuit, 
                   params_U: np.ndarray, params_V: np.ndarray, rank: int, 
-                  noise_model: NoiseModel = None) -> float:
+                  noise_model: NoiseModel = None) -> tuple:
     """
-    Computes quantum-native loss based on three principles:
-    1. Maximizing singular values (energy maximization)
-    2. Maintaining orthogonality
-    3. Preserving matrix properties (trace norm, Frobenius norm)
+    Computes quantum-native loss and returns both loss value and detailed metrics.
     """
     U = get_unitary(circuit_U, params_U)
     V = get_unitary(circuit_V, params_V)
@@ -75,45 +72,51 @@ def loss_function(matrix: np.ndarray, circuit_U: QuantumCircuit, circuit_V: Quan
         U = apply_noise_to_unitary(U, noise_model)
         V = apply_noise_to_unitary(V, noise_model)
     
-    loss = 0.0
-    M = matrix
-    
     # 1. Energy Maximization Term
     energy_terms = []
     for i in range(rank):
         u_i = U[:, i]
         v_i = V[:, i]
-        energy = np.abs(u_i.conj() @ M @ v_i)
+        energy = np.abs(u_i.conj() @ matrix @ v_i)
         energy_terms.append(energy)
     
-    # Sort energy terms to encourage proper ordering of singular values
-    energy_terms.sort(reverse=True)
-    energy_loss = -sum(energy_terms[i] * (rank - i) for i in range(rank))
+    energy_terms = np.array(energy_terms)
+    target_ratios = np.array([1.0, 0.5, 0.25, 0.125])[:rank-1]  # Expected decay
+    current_ratios = energy_terms[:-1] / energy_terms[1:]
+    ratio_loss = np.sum((current_ratios - target_ratios[:len(current_ratios)])**2)
     
     # 2. Orthogonality Terms
-    ortho_loss_U = 0.0
-    ortho_loss_V = 0.0
+    ortho_loss = 0.0
     for i in range(rank):
         for j in range(i):
-            ortho_loss_U += np.abs(U[:, i].conj() @ U[:, j])**2
-            ortho_loss_V += np.abs(V[:, i].conj() @ V[:, j])**2
+            ortho_loss += np.abs(U[:, i].conj() @ U[:, j])**2
+            ortho_loss += np.abs(V[:, i].conj() @ V[:, j])**2
     
     # 3. Matrix Property Preservation
-    # Compute difference between input and reconstructed matrix properties
-    reconstructed = U @ np.diag(energy_terms) @ V.conj().T
-    trace_diff = np.abs(np.trace(M) - np.trace(reconstructed))
-    frob_diff = np.abs(np.linalg.norm(M, 'fro') - np.linalg.norm(reconstructed, 'fro'))
+    reconstructed = U[:, :rank] @ np.diag(energy_terms) @ V[:, :rank].conj().T
+    frob_norm_orig = np.linalg.norm(matrix, 'fro')
+    frob_norm_recon = np.linalg.norm(reconstructed, 'fro')
+    norm_loss = (frob_norm_orig - frob_norm_recon)**2
     
-    # Weighted combination of all terms
-    alpha = 1.0  # Energy weight
-    beta = 2.0   # Orthogonality weight
-    gamma = 0.5  # Property preservation weight
+    # Combine losses with weights
+    alpha = 1.0    # Energy ratio preservation
+    beta = 10.0    # Orthogonality
+    gamma = 5.0    # Norm preservation
     
-    total_loss = (alpha * energy_loss + 
-                  beta * (ortho_loss_U + ortho_loss_V) +
-                  gamma * (trace_diff + frob_diff))
+    total_loss = (alpha * ratio_loss + 
+                  beta * ortho_loss + 
+                  gamma * norm_loss)
     
-    return total_loss
+    # Create metrics dictionary
+    metrics = {
+        'ratio_loss': ratio_loss,
+        'ortho_loss': ortho_loss,
+        'norm_loss': norm_loss,
+        'energy_terms': energy_terms,
+        'total_loss': total_loss
+    }
+    
+    return total_loss, metrics
 
 
 def objective(params: np.ndarray, matrix: np.ndarray, circuit_U: QuantumCircuit, 
@@ -148,6 +151,8 @@ def optimize_vqsvd(matrix: np.ndarray, rank: int, num_qubits: int, circuit_depth
         
         # Calculate current singular values from quantum state
         singular_values = extract_singular_values(circuit_U, circuit_V, params)
+    
+    final_params = params
     
     return final_params, singular_values
 
@@ -200,90 +205,98 @@ def plot_singular_value_error(singular_values_history, true_singular_values):
     plt.show()
 
 
-def run_vqsvd(matrix: np.ndarray, rank: int, num_qubits: int, circuit_depth: int, 
-             lr: float, max_iters: int, noise_model: NoiseModel = None) -> dict:
+def run_vqsvd(matrix: np.ndarray, rank: int, num_qubits: int, lr: float, max_iters: int, 
+              noise_model: NoiseModel = None) -> dict:
     """
-    Executes the entire QSVD process: optimization, plotting, and comparison.
-
-    Args:
-        matrix (np.ndarray): The matrix to decompose.
-        rank (int): Number of singular values/components.
-        num_qubits (int): Number of qubits.
-        circuit_depth (int): Depth of the quantum circuits.
-        lr (float): Learning rate.
-        max_iters (int): Maximum number of iterations.
-        noise_model (NoiseModel, optional): Noise model to apply. Defaults to None.
-
-    Returns:
-        dict: Dictionary containing comparison metrics and optimization history.
+    Enhanced VQSVD execution with all our improvements.
     """
-    import time
+    # Step 1: Circuit Setup with Optimal Depth
+    circuit_depth = optimize_circuit_depth(num_qubits, matrix)
+    print(f"Optimized circuit depth: {circuit_depth}")
     
-    # Initialize quantum circuits for U and V
     circuit_U = create_parameterized_circuit(num_qubits, circuit_depth, 'U')
     circuit_V = create_parameterized_circuit(num_qubits, circuit_depth, 'V')
     
-    # Initialize parameters randomly
+    # Analyze circuit expressiveness
+    analyze_circuit_expressiveness(circuit_U, circuit_V, matrix.size)
+    
+    # Step 2: Initialize Parameters
     params = initialize_random_parameters(circuit_U, circuit_V)
     
-    # Initialize backend
-    backend = AerSimulator(method='statevector')
+    # Step 3: Setup Optimization Tools
+    convergence_checker = ConvergenceChecker(
+        window_size=50,
+        tolerance=1e-6,
+        min_iterations=100
+    )
     
+    # Step 4: Optimization Loop with Enhanced Monitoring
     loss_history = []
     singular_values_history = []
+    metrics_history = []
     
-    start_time = time.time()
-    
-    # Add adaptive learning rate
-    initial_lr = lr
+    qsvd = SimulatedQSVD(num_qubits, circuit_depth)
+    monitor = PerformanceMonitor()
     
     for iter in range(max_iters):
-        # Compute loss and gradients
-        current_loss = loss_function(matrix, circuit_U, circuit_V, 
-                                   params[:len(circuit_U.parameters)],
-                                   params[len(circuit_U.parameters):],
-                                   rank, noise_model)
+        # 4.1: Compute Loss with Detailed Metrics
+        current_loss, metrics = loss_function(
+            matrix, circuit_U, circuit_V,
+            params[:len(circuit_U.parameters)],
+            params[len(circuit_U.parameters):],
+            rank, noise_model
+        )
         
-        # Compute gradients using parameter shift
-        gradients = compute_gradients(circuit_U, circuit_V, params, matrix, rank)
-        
-        # Adaptive learning rate
-        lr = initial_lr / (1 + iter/100)
-        
-        # Update parameters with gradient clipping
-        grad_norm = np.linalg.norm(gradients)
-        if grad_norm > 1.0:
-            gradients = gradients / grad_norm
-        params = params - lr * gradients
-        
-        # Extract current singular values
-        singular_values = extract_singular_values(circuit_U, circuit_V, params, matrix)
-        
-        # Store history
+        # 4.2: Store Metrics
         loss_history.append(current_loss)
+        metrics_history.append(metrics)
+        
+        # 4.3: Extract and Store Current Singular Values
+        singular_values = extract_singular_values(
+            circuit_U, circuit_V, params, matrix
+        )
         singular_values_history.append(singular_values)
         
-        # Early stopping check
-        if len(loss_history) > 10:
-            if np.abs(loss_history[-1] - loss_history[-10]) < 1e-6:
-                print("Converged!")
-                break
+        # 4.4: Check Convergence
+        if convergence_checker.check_convergence(current_loss):
+            print(f"Converged at iteration {iter}")
+            break
+        
+        # 4.5: Update Parameters
+        gradients = compute_gradients(circuit_U, circuit_V, params, matrix, rank)
+        params = update_parameters(params, gradients, lr)
+        
+        # 4.6: Progress Reporting
+        if iter % 10 == 0:
+            print(f"Iteration {iter}:")
+            print(f"  Loss: {current_loss:.6f}")
+            print(f"  Current singular values: {singular_values}")
+            print(f"  Metrics: {metrics}")
+        
+        # Add monitoring
+        current_values = qsvd.simulate_svd(matrix, params_U, params_V)
+        monitor.update(current_values, true_values, circuit_state, noise_level)
         
         if iter % 10 == 0:
-            print(f"Iteration {iter}: Loss = {current_loss:.6f}")
-            print(f"Singular Values: {singular_values}")
+            report = monitor.generate_report()
+            print(f"Iteration {iter} Report:")
+            print(f"  Average Error: {report['avg_error']:.4f}")
+            print(f"  Fidelity Trend: {'Improving' if report['fidelity_trend'][-1] > 0 else 'Degrading'}")
+            print(f"  Noise Correlation: {report['noise_correlation']:.4f}")
     
-    training_time = time.time() - start_time
+    # Step 5: Final Analysis and Results
+    results = {
+        "final_singular_values": singular_values,
+        "Loss History": loss_history,
+        "metrics_history": metrics_history,
+        "Singular Values History": singular_values_history,
+        "final_parameters": params,
+        "circuit_depth": circuit_depth,
+        "convergence_iterations": iter,
+        "Classical Singular Values": np.linalg.svd(matrix)[1][:rank]
+    }
     
-    # Extract final singular values
-    final_singular_values = singular_values_history[-1]
-    
-    # Compare with classical SVD
-    comparison = compare_with_classical_svd(matrix, final_singular_values, training_time, rank)
-    comparison["Loss History"] = loss_history
-    comparison["Singular Values History"] = singular_values_history
-    
-    return comparison
+    return results
 
 
 # Additional utility functions
@@ -330,14 +343,7 @@ def plot_optimization_landscape(matrix: np.ndarray, circuit_U: QuantumCircuit, c
     plt.show()
 
 
-def apply_qsvd_and_calibrate(circuit: QuantumCircuit, operator: np.ndarray) -> QuantumCircuit:
-    """
-    Decomposes the circuit's unitary operator using QSVD and applies calibration adjustments.
-    Currently serves as a placeholder for future enhancements.
-    """
-    Q, Sigma, V_dagger = qsvd_decompose(operator)
-    # Future work: Adjust the circuit based on decomposed matrices
-    return circuit
+
 
 
 def encode_matrix_as_state(matrix: np.ndarray, num_qubits: int) -> QuantumCircuit:
@@ -379,17 +385,21 @@ def get_gradient(circuit: QuantumCircuit, params: np.ndarray, matrix: np.ndarray
 
 def initialize_random_parameters(circuit_U: QuantumCircuit, circuit_V: QuantumCircuit) -> np.ndarray:
     """
-    Initialize the parameters for the quantum circuits U and V randomly.
-
-    Args:
-        circuit_U (QuantumCircuit): Quantum circuit for U.
-        circuit_V (QuantumCircuit): Quantum circuit for V.
-
-    Returns:
-        np.ndarray: Array of initialized parameters, concatenated for U and V.
+    Initialize parameters using Glorot-inspired quantum initialization
     """
-    params_U = np.random.uniform(-np.pi, np.pi, len(circuit_U.parameters))
-    params_V = np.random.uniform(-np.pi, np.pi, len(circuit_V.parameters))
+    def quantum_glorot_init(n_in, n_out):
+        limit = np.sqrt(6 / (n_in + n_out))
+        return np.random.uniform(-limit * np.pi, limit * np.pi)
+    
+    # Calculate effective input/output dimensions
+    n_in = 2**circuit_U.num_qubits
+    n_out = 2**circuit_V.num_qubits
+    
+    params_U = np.array([quantum_glorot_init(n_in, n_out) 
+                        for _ in range(len(circuit_U.parameters))])
+    params_V = np.array([quantum_glorot_init(n_out, n_in) 
+                        for _ in range(len(circuit_V.parameters))])
+    
     return np.concatenate([params_U, params_V])
 
 
@@ -537,27 +547,90 @@ def compare_with_classical_svd(matrix: np.ndarray, quantum_singular_values: np.n
     return comparison
 
 
-def compute_gradients(circuit, params, matrix):
+def compute_gradients(circuit_U: QuantumCircuit, circuit_V: QuantumCircuit, 
+                     params: np.ndarray, matrix: np.ndarray, rank: int) -> np.ndarray:
+    """
+    Compute gradients with proper handling of loss function tuple returns
+    """
     gradients = []
-    shift = np.pi/2
+    shift = np.pi/4  # Reduced shift for better numerical stability
     
+    # Split parameters
+    num_params_U = len(circuit_U.parameters)
+    params_U = params[:num_params_U]
+    params_V = params[num_params_U:]
+    
+    # Add gradient normalization
+    all_gradients = []
+    
+    # Compute all gradients first
     for i in range(len(params)):
-        # Shift parameter in positive direction
         params_plus = params.copy()
-        params_plus[i] += shift
-        
-        # Shift parameter in negative direction
         params_minus = params.copy()
+        params_plus[i] += shift
         params_minus[i] -= shift
         
-        # Compute gradient using parameter-shift rule
-        expectation_plus = measure_quantum_expectation(circuit, params_plus, matrix)
-        expectation_minus = measure_quantum_expectation(circuit, params_minus, matrix)
-        gradient = (expectation_plus - expectation_minus) / (2 * np.sin(shift))
+        # Extract only the loss value from the tuple returns
+        loss_plus, _ = loss_function(matrix, circuit_U, circuit_V, 
+                                   params_plus[:num_params_U], 
+                                   params_plus[num_params_U:], 
+                                   rank)
+        loss_minus, _ = loss_function(matrix, circuit_U, circuit_V, 
+                                    params_minus[:num_params_U], 
+                                    params_minus[num_params_U:], 
+                                    rank)
         
-        gradients.append(gradient)
+        grad = (loss_plus - loss_minus) / (2 * np.sin(shift))
+        all_gradients.append(grad)
     
-    return np.array(gradients)
+    # Normalize gradients
+    all_gradients = np.array(all_gradients)
+    grad_norm = np.linalg.norm(all_gradients)
+    if grad_norm > 1e-8:
+        all_gradients = all_gradients / grad_norm
+    
+    return all_gradients
+
+
+class ConvergenceChecker:
+    def __init__(self, window_size=50, tolerance=1e-6, min_iterations=100):
+        self.window_size = window_size
+        self.tolerance = tolerance
+        self.min_iterations = min_iterations
+        self.loss_history = []
+        
+    def check_convergence(self, loss):
+        self.loss_history.append(loss)
+        
+        if len(self.loss_history) < self.min_iterations:
+            return False
+            
+        if len(self.loss_history) >= self.window_size:
+            window = self.loss_history[-self.window_size:]
+            slope = np.polyfit(range(self.window_size), window, 1)[0]
+            variance = np.var(window)
+            
+            return abs(slope) < self.tolerance and variance < self.tolerance
+            
+        return False
+
+
+def optimize_circuit_depth(num_qubits: int, matrix: np.ndarray) -> int:
+    """
+    Determines optimal circuit depth based on matrix properties
+    and system size.
+    """
+    # Analyze matrix complexity
+    _, s, _ = np.linalg.svd(matrix)
+    effective_rank = np.sum(s > 1e-10)
+    
+    # Calculate minimum required depth
+    min_depth = int(np.ceil(np.log2(effective_rank)))
+    
+    # Add overhead for noise resilience
+    noise_overhead = int(np.ceil(np.log2(num_qubits)))
+    
+    return max(2, min_depth + noise_overhead)
 
 
 

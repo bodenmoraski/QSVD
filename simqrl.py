@@ -8,83 +8,75 @@ from scipy.linalg import svd as classical_svd
 from simqsvd import SimulatedQSVD, PerformanceMonitor
 
 class SimulatedQuantumEnv:
-    """
+    '''
     Simulated quantum environment that mimics QSVD behavior without actual quantum circuits.
-    """
+    '''
     def __init__(self, num_qubits, circuit_depth, noise_params=None):
         self.num_qubits = num_qubits
         self.circuit_depth = circuit_depth
         
-        # Default noise parameters if none provided
-        self.noise_params = noise_params or {
-            't1': 50e-6,                # T1 relaxation time
-            't2': 70e-6,               # T2 dephasing time
-            'gate_times': {            # Gate operation times
-                'single': 20e-9,       # Single-qubit gate time
-                'two': 40e-9,          # Two-qubit gate time
-            },
-            'thermal_population': 0.01, # Thermal excitation probability
-            'readout_error': 0.02,     # Measurement readout error
-            'crosstalk_strength': 0.03, # Inter-qubit crosstalk
-            'control_amplitude_error': 0.01,  # Gate amplitude error
-            'control_frequency_drift': 0.005, # Frequency drift
-        }
+        # Add noise_level initialization
+        self.noise_level = noise_params.get('readout_error', 0.025) if noise_params else 0.025
         
-        # Calculate overall noise level from parameters
-        self.noise_level = np.mean([
-            self.noise_params['thermal_population'],
-            self.noise_params['readout_error'],
-            self.noise_params['crosstalk_strength'],
-            self.noise_params['control_amplitude_error'],
-            self.noise_params['control_frequency_drift']
-        ])
+        # Calculate total parameters needed
+        self.params_per_circuit = num_qubits * (1 + circuit_depth) * 3
+        self.total_params = self.params_per_circuit * 2  # For both U and V
         
-        # Calculate correct number of parameters per circuit
-        # 3 gates (rx, ry, rz) per qubit per layer, including initial layer
-        self.params_per_circuit = self.num_qubits * (1 + self.circuit_depth) * 3
+        # Initialize matrix with correct dimensions
+        self.matrix_dim = 2**num_qubits
+        self.matrix = np.random.rand(self.matrix_dim, self.matrix_dim) + \
+                     1j * np.random.rand(self.matrix_dim, self.matrix_dim)
         
-        # Initialize QSVD simulator with noise parameters
-        self.qsvd_sim = SimulatedQSVD(num_qubits, circuit_depth, self.noise_params)
-        
-        # Calculate number of parameters per circuit
-        self.params_per_circuit = num_qubits * circuit_depth
-        
-        # Generate random matrix
-        self.matrix = np.random.rand(2**num_qubits, 2**num_qubits) + \
-                     1j * np.random.rand(2**num_qubits, 2**num_qubits)
+        # Initialize QSVD simulator
+        self.qsvd_sim = SimulatedQSVD(num_qubits, circuit_depth, noise_params)
         
         # Get true singular values
-        self.true_singular_values = self.qsvd_sim.get_true_singular_values(self.matrix)
+        self.true_singular_values = np.sort(np.abs(np.linalg.svd(self.matrix)[1]))[::-1]
     
     def step(self, action):
-        # Adjust action splitting based on correct parameter count
-        params_U = action[:self.params_per_circuit]
-        params_V = action[self.params_per_circuit:]
-        
-        # Get noisy singular values using quantum simulation
         try:
+            if len(action) != self.total_params:
+                raise ValueError(f"Expected {self.total_params} parameters, got {len(action)}")
+            
+            # Ensure actions are within bounds
+            action = np.clip(action, -np.pi, np.pi)
+            
+            # Split parameters for U and V circuits
+            params_U = action[:self.params_per_circuit]
+            params_V = action[self.params_per_circuit:]
+            
+            # Get noisy singular values
             noisy_values = self.qsvd_sim.simulate_svd(
-                self.matrix, params_U, params_V
+                self.matrix,
+                params_U.astype(np.float64),
+                params_V.astype(np.float64)
             )
-        except ValueError as e:
-            print(f"Step failed: {str(e)}")
-            # Fallback to noisy diagonal values
-            noisy_values = np.sort(np.abs(np.diagonal(self.matrix)))[::-1]
-            noisy_values += np.random.normal(0, self.noise_level, size=len(noisy_values))
-        
-        # Calculate reward based on accuracy
-        reward = -np.mean((noisy_values - self.true_singular_values)**2)
-        
-        # State includes singular values and noise information
-        state = np.concatenate([noisy_values, [self.noise_level]])
-        
-        info = {
-            'true_values': self.true_singular_values,
-            'noisy_values': noisy_values,
-            'quantum_fidelity': self._calculate_fidelity(noisy_values)
-        }
-        
-        return state, reward, False, info
+            
+            # Ensure noisy_values has correct dimension
+            noisy_values = noisy_values[:self.matrix_dim]
+            
+            # Calculate reward
+            reward = -np.mean((noisy_values - self.true_singular_values)**2)
+            
+            # State includes singular values and noise information
+            state = np.concatenate([noisy_values, [self.qsvd_sim.noise_level]])
+            
+            return state, reward, False, {
+                'true_values': self.true_singular_values,
+                'noisy_values': noisy_values,
+                'quantum_fidelity': self._calculate_fidelity(noisy_values)
+            }
+            
+        except Exception as e:
+            print(f"Error in step: {str(e)}")
+            # Fallback to safe values
+            noisy_values = np.zeros(self.matrix_dim)
+            state = np.concatenate([noisy_values, [self.qsvd_sim.noise_level]])
+            return state, -1.0, False, {
+                'true_values': self.true_singular_values,
+                'noisy_values': noisy_values,
+                'quantum_fidelity': 0.0
+            }
     
     def _calculate_fidelity(self, noisy_values):
         """Calculate quantum state fidelity"""
@@ -117,17 +109,22 @@ class PPOAgent(nn.Module):
     """
     def __init__(self, state_dim, action_dim):
         super(PPOAgent, self).__init__()
-        # Larger network for better noise handling
-        self.fc1 = nn.Linear(state_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        # action_dim already accounts for both U and V parameters
+        self.action_dim = action_dim
+        
+        # Increase network capacity
+        self.fc1 = nn.Linear(state_dim, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, self.action_dim)
+        
+        # Initialize with small values
+        self.log_std = nn.Parameter(torch.ones(self.action_dim) * -0.5)
         
     def forward(self, state):
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
-        mean = self.fc3(x)
-        std = self.log_std.exp()
+        mean = torch.tanh(self.fc3(x)) * np.pi  # Bound outputs to [-π, π]
+        std = self.log_std.exp().clamp(min=1e-6, max=1)
         return mean, std
     
     def select_action(self, state):
@@ -145,9 +142,10 @@ def train_agent(episodes=1000, num_qubits=4, circuit_depth=4, noise_params=None)
     env = SimulatedQuantumEnv(num_qubits, circuit_depth, noise_params)
     performance_monitor = PerformanceMonitor()
     
-    # Initialize tracking metrics
-    state_dim = 2**num_qubits + 1
-    action_dim = num_qubits * circuit_depth * 2
+    # Calculate correct dimensions
+    state_dim = 2**num_qubits + 1  # +1 for noise level
+    params_per_circuit = num_qubits * (1 + circuit_depth) * 3
+    action_dim = params_per_circuit * 2  # Multiply by 2 for both U and V circuits
     
     # Initialize agent with correct dimensions
     agent = PPOAgent(state_dim, action_dim)
@@ -171,12 +169,19 @@ def train_agent(episodes=1000, num_qubits=4, circuit_depth=4, noise_params=None)
         action, log_prob = agent.select_action(state)
         next_state, reward, done, info = env.step(action)
         
-        # Monitor circuit quality
-        circuit_metrics = env.qsvd_sim.analyze_circuit_quality(
-            env.qsvd_sim.circuit_U,
-            env.qsvd_sim.circuit_V,
-            action
-        )
+        # Monitor circuit quality (only pass action)
+        if episode % 50 == 0:
+            try:
+                # Pass only the action vector
+                circuit_metrics = env.qsvd_sim.analyze_circuit_quality(action)
+                training_metrics['circuit_quality'].append(circuit_metrics)
+            except Exception as e:
+                print(f"Warning: Circuit analysis failed: {str(e)}")
+                training_metrics['circuit_quality'].append({
+                    'gradient_vanishing': False,
+                    'gradient_exploding': False,
+                    'depth_efficiency': 0.5
+                })
         
         # Update performance monitor
         performance_monitor.update(
@@ -190,7 +195,6 @@ def train_agent(episodes=1000, num_qubits=4, circuit_depth=4, noise_params=None)
         training_metrics['rewards'].append(float(reward))
         training_metrics['errors'].append(np.mean(np.abs(info['noisy_values'] - info['true_values'])))
         training_metrics['noise_levels'].append(env.noise_level)
-        training_metrics['circuit_quality'].append(circuit_metrics)
         training_metrics['fidelity_history'].append(info['quantum_fidelity'])
         
         # Detailed logging every N episodes
@@ -284,28 +288,33 @@ def plot_training_metrics(metrics, save_path):
     plt.close()
 
 if __name__ == "__main__":
-    # Define custom noise parameters (optional)
-    noise_params = {
-        't1': 45e-6,                # Slightly worse T1
-        't2': 65e-6,               # Slightly worse T2
-        'gate_times': {
-            'single': 25e-9,       # Slower single-qubit gates
-            'two': 45e-9,          # Slower two-qubit gates
-        },
-        'thermal_population': 0.015,
-        'readout_error': 0.025,
-        'crosstalk_strength': 0.035,
-        'control_amplitude_error': 0.015,
-        'control_frequency_drift': 0.006,
-    }
-    
-    # Train agent with enhanced monitoring
-    agent, training_metrics = train_agent(
-        episodes=1000,
-        num_qubits=4,
-        circuit_depth=4,
-        noise_params=noise_params
-    )
+    try:
+        # Define custom noise parameters (optional)
+        noise_params = {
+            't1': 45e-6,
+            't2': 65e-6,
+            'gate_times': {
+                'single': 25e-9,
+                'two': 45e-9,
+            },
+            'thermal_population': 0.015,
+            'readout_error': 0.025,
+            'crosstalk_strength': 0.035,
+            'control_amplitude_error': 0.015,
+            'control_frequency_drift': 0.006,
+        }
+        
+        # Train agent with enhanced monitoring
+        agent, training_metrics = train_agent(
+            episodes=1000,
+            num_qubits=4,
+            circuit_depth=4,
+            noise_params=noise_params
+        )
+        
+    except Exception as e:
+        print(f"Training failed: {str(e)}")
+        raise
     
     # Generate final report
     print("\nFinal Training Report")

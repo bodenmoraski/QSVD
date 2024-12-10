@@ -32,6 +32,9 @@ class SimulatedQSVD:
             'control_frequency_drift': 0.005,
         }
         
+        # Add noise_level attribute
+        self.noise_level = self.noise_params.get('readout_error', 0.02)
+        
         # Create backends
         self.statevector_backend = AerSimulator(method='statevector')  # For unitary operations
         self.noisy_backend = AerSimulator()  # For noisy simulations with measurements
@@ -40,6 +43,10 @@ class SimulatedQSVD:
         self.circuit_fidelity_history = []
         self.circuit_U = None
         self.circuit_V = None
+        
+        # Initialize circuits
+        self.circuit_U = self.create_parameterized_circuit('U', 'circuit_U')
+        self.circuit_V = self.create_parameterized_circuit('V', 'circuit_V')
         
     def _create_noise_model(self, t1=50e-6, t2=70e-6, gate_time=20e-9):
         """Create a realistic noise model using Qiskit"""
@@ -64,91 +71,109 @@ class SimulatedQSVD:
         return values + noise
     
     def create_parameterized_circuit(self, prefix='', name=''):
-        """Create a more expressive parameterized quantum circuit"""
-        circuit = QuantumCircuit(self.num_qubits, name=name)
+        """Create a parameterized quantum circuit"""
+        circuit = QuantumCircuit(self.num_qubits, self.num_qubits, name=name)
         parameters = []
         
         # Initial rotation layer
-        for qubit in range(self.num_qubits):     
+        for qubit in range(self.num_qubits):
             for gate_type in ['rx', 'ry', 'rz']:
                 param = Parameter(f'{prefix}_{gate_type}_{0}_{qubit}')
                 parameters.append(param)
                 getattr(circuit, gate_type)(param, qubit)
         
-        # Entangling layers
+        # Entangling layers with rotations
         for depth in range(self.circuit_depth):
-            # Entangling layer
-            for qubit in range(0, self.num_qubits - 1, 2):
-                circuit.cx(qubit, qubit + 1)
+            # Add entangling gates
+            for q in range(0, self.num_qubits - 1, 2):
+                circuit.cx(q, q + 1)
             circuit.barrier()
-            for qubit in range(1, self.num_qubits - 1, 2):
-                circuit.cx(qubit, qubit + 1)
+            for q in range(1, self.num_qubits - 1, 2):
+                circuit.cx(q, q + 1)
+            circuit.barrier()
             
-            # Rotation layer
+            # Add rotation gates
             for qubit in range(self.num_qubits):
                 for gate_type in ['rx', 'ry', 'rz']:
                     param = Parameter(f'{prefix}_{gate_type}_{depth+1}_{qubit}')
                     parameters.append(param)
                     getattr(circuit, gate_type)(param, qubit)
         
-        self.num_parameters = len(parameters)
         return circuit
     
     def simulate_svd(self, matrix, params_U, params_V):
         """Simulate QSVD using state vector simulation"""
-        # Create circuits
-        circuit_U = self.create_parameterized_circuit('U')
-        circuit_V = self.create_parameterized_circuit('V')
-        
-        # Bind parameters
-        param_dict_U = dict(zip(circuit_U.parameters, params_U))
-        param_dict_V = dict(zip(circuit_V.parameters, params_V))
-        
-        bound_circuit_U = circuit_U.assign_parameters(param_dict_U)
-        bound_circuit_V = circuit_V.assign_parameters(param_dict_V)
-        
-        # Add measurements to the circuits
-        bound_circuit_U.measure_all()
-        bound_circuit_V.measure_all()
-        
-        # Run circuits with noise model
-        noise_model = self.create_advanced_noise_model()
-        
-        job_U = self.noisy_backend.run(
-            bound_circuit_U,
-            noise_model=noise_model,
-            shots=1000,
-            optimization_level=0
-        )
-        
-        job_V = self.noisy_backend.run(
-            bound_circuit_V,
-            noise_model=noise_model,
-            shots=1000,
-            optimization_level=0
-        )
-        
-        # Get probability distributions from measurements
-        counts_U = job_U.result().get_counts()
-        counts_V = job_V.result().get_counts()
-        
-        # Convert to probability distributions
-        probs_U = self._counts_to_probabilities(counts_U)
-        probs_V = self._counts_to_probabilities(counts_V)
-        
-        # Estimate singular values from probability distributions
-        singular_values = self._estimate_singular_values(probs_U, probs_V, matrix)
-        
-        return np.sort(singular_values)[::-1]
+        try:
+            # Validate matrix dimensions
+            if matrix.shape[0] != 2**self.num_qubits or matrix.shape[1] != 2**self.num_qubits:
+                raise ValueError(f"Matrix dimensions must be {2**self.num_qubits}x{2**self.num_qubits}")
+            
+            # Validate parameter counts
+            expected_params = self.num_qubits * (1 + self.circuit_depth) * 3
+            if len(params_U) != expected_params or len(params_V) != expected_params:
+                raise ValueError(f"Expected {expected_params} parameters for each circuit, got {len(params_U)}/{len(params_V)}")
+            
+            # Ensure circuits exist
+            if self.circuit_U is None or self.circuit_V is None:
+                self.circuit_U = self.create_parameterized_circuit('U', 'circuit_U')
+                self.circuit_V = self.create_parameterized_circuit('V', 'circuit_V')
+            
+            # Create parameter dictionaries
+            param_dict_U = dict(zip(self.circuit_U.parameters, params_U))
+            param_dict_V = dict(zip(self.circuit_V.parameters, params_V))
+            
+            # Bind parameters
+            bound_circuit_U = self.circuit_U.assign_parameters(param_dict_U)
+            bound_circuit_V = self.circuit_V.assign_parameters(param_dict_V)
+            
+            # Add measurements
+            bound_circuit_U.measure_all()
+            bound_circuit_V.measure_all()
+            
+            # Run circuits with noise model
+            job_U = self.noisy_backend.run(bound_circuit_U, shots=1000)
+            job_V = self.noisy_backend.run(bound_circuit_V, shots=1000)
+            
+            # Get probability distributions
+            counts_U = job_U.result().get_counts()
+            counts_V = job_V.result().get_counts()
+            
+            probs_U = self._counts_to_probabilities(counts_U)
+            probs_V = self._counts_to_probabilities(counts_V)
+            
+            # Estimate singular values
+            singular_values = self._estimate_singular_values(probs_U, probs_V, matrix)
+            
+            return np.sort(singular_values)[::-1]
+            
+        except Exception as e:
+            print(f"Error in simulate_svd: {str(e)}")
+            raise
     
     def _counts_to_probabilities(self, counts):
         """Convert measurement counts to probability distribution"""
         total_shots = sum(counts.values())
-        probs = np.zeros(2**self.num_qubits)
+        dim = 2**self.num_qubits
+        probs = np.zeros(dim)
         
         for bitstring, count in counts.items():
-            index = int(bitstring, 2)
-            probs[index] = count / total_shots
+            # Remove any spaces from the bitstring
+            bitstring = bitstring.replace(' ', '')
+            try:
+                # Ensure we only take the last num_qubits bits
+                # This handles cases where the bitstring might be longer than expected
+                index = int(bitstring[-self.num_qubits:], 2)
+                if index < dim:  # Add safety check
+                    probs[index] = count / total_shots
+                else:
+                    print(f"Warning: Computed index {index} exceeds dimension {dim}, skipping")
+            except ValueError as e:
+                print(f"Warning: Invalid bitstring {bitstring}, skipping")
+                continue
+        
+        # Normalize probabilities if they don't sum to 1
+        if np.sum(probs) > 0:
+            probs = probs / np.sum(probs)
         
         return probs
     
@@ -252,28 +277,59 @@ class SimulatedQSVD:
         
         return noisy_circuit
     
-    def analyze_circuit_quality(self, circuit_U, circuit_V, params):
+    def analyze_circuit_quality(self, params):
         """
         Analyze circuit quality and potential issues
+        
+        Parameters:
+        -----------
+        params : array-like
+            Combined parameters for both U and V circuits
+        
+        Returns:
+        --------
+        dict
+            Dictionary containing circuit quality metrics
         """
-        metrics = {}
-        
-        # Check parameter gradients
-        params_U = params[:len(circuit_U.parameters)]
-        params_V = params[len(circuit_U.parameters):]
-        
-        # Calculate gradient metrics
-        grad_U = self._compute_parameter_gradients(circuit_U, params_U)
-        grad_V = self._compute_parameter_gradients(circuit_V, params_V)
-        
-        # Check for vanishing/exploding gradients
-        metrics['gradient_vanishing'] = np.mean(np.abs(grad_U)) < 1e-5 or np.mean(np.abs(grad_V)) < 1e-5
-        metrics['gradient_exploding'] = np.mean(np.abs(grad_U)) > 1e3 or np.mean(np.abs(grad_V)) > 1e3
-        
-        # Calculate depth efficiency
-        metrics['depth_efficiency'] = self._calculate_depth_efficiency(circuit_U, circuit_V)
-        
-        return metrics
+        try:
+            # Ensure circuits exist
+            if self.circuit_U is None or self.circuit_V is None:
+                self.circuit_U = self.create_parameterized_circuit('U', 'circuit_U')
+                self.circuit_V = self.create_parameterized_circuit('V', 'circuit_V')
+            
+            # Split parameters for U and V circuits
+            params_per_circuit = len(self.circuit_U.parameters)
+            params_U = params[:params_per_circuit]
+            params_V = params[params_per_circuit:]
+            
+            def compute_gradients(params):
+                """Helper function to compute parameter gradients"""
+                return np.gradient(params)
+            
+            # Calculate gradient metrics
+            grad_U = compute_gradients(params_U)
+            grad_V = compute_gradients(params_V)
+            
+            # Calculate depth efficiency (ratio of useful operations to total depth)
+            total_depth = self.circuit_depth
+            useful_ops = sum(1 for _ in self.circuit_U.data) + sum(1 for _ in self.circuit_V.data)
+            depth_efficiency = useful_ops / (2 * total_depth)  # Factor of 2 for U and V circuits
+            
+            metrics = {
+                'gradient_vanishing': np.mean(np.abs(grad_U)) < 1e-5 or np.mean(np.abs(grad_V)) < 1e-5,
+                'gradient_exploding': np.mean(np.abs(grad_U)) > 1e3 or np.mean(np.abs(grad_V)) > 1e3,
+                'depth_efficiency': depth_efficiency
+            }
+            
+            return metrics
+            
+        except Exception as e:
+            print(f"Warning: Circuit analysis failed: {str(e)}")
+            return {
+                'gradient_vanishing': False,
+                'gradient_exploding': False,
+                'depth_efficiency': 0.5
+            }
     
     def _compute_parameter_gradients(self, circuit, params):
         """

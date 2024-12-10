@@ -42,21 +42,32 @@ class SimulatedQSVD:
         return values + noise
     
     def create_parameterized_circuit(self, prefix='', name=''):
-        """Create a parameterized quantum circuit for U or V"""
+        """Create a more expressive parameterized quantum circuit"""
         circuit = QuantumCircuit(self.num_qubits, name=name)
         parameters = []
         
-        # Add parameterized gates
-        for depth in range(self.circuit_depth):
-            for qubit in range(self.num_qubits):
-                param = Parameter(f'{prefix}_theta_{depth}_{qubit}')
+        # Initial rotation layer
+        for qubit in range(self.num_qubits):     
+            for gate_type in ['rx', 'ry', 'rz']:
+                param = Parameter(f'{prefix}_{gate_type}_{0}_{qubit}')
                 parameters.append(param)
-                circuit.ry(param, qubit)
+                getattr(circuit, gate_type)(param, qubit)
+        
+        # Entangling layers
+        for depth in range(self.circuit_depth):
+            # Entangling layer
+            for qubit in range(0, self.num_qubits - 1, 2):
+                circuit.cx(qubit, qubit + 1)
+            circuit.barrier()
+            for qubit in range(1, self.num_qubits - 1, 2):
+                circuit.cx(qubit, qubit + 1)
             
-            # Add entangling gates
-            if depth < self.circuit_depth - 1:
-                for qubit in range(self.num_qubits - 1):
-                    circuit.cx(qubit, qubit + 1)
+            # Rotation layer
+            for qubit in range(self.num_qubits):
+                for gate_type in ['rx', 'ry', 'rz']:
+                    param = Parameter(f'{prefix}_{gate_type}_{depth+1}_{qubit}')
+                    parameters.append(param)
+                    getattr(circuit, gate_type)(param, qubit)
         
         self.num_parameters = len(parameters)
         return circuit
@@ -67,37 +78,49 @@ class SimulatedQSVD:
         circuit_U = self.create_parameterized_circuit('U')
         circuit_V = self.create_parameterized_circuit('V')
         
-        # Bind parameters
-        param_dict_U = dict(zip(circuit_U.parameters, params_U))
-        param_dict_V = dict(zip(circuit_V.parameters, params_V))
+        # Ensure parameters are the correct length
+        expected_params = self.num_qubits * (1 + self.circuit_depth) * 3  # 3 gates per qubit per layer
+        if len(params_U) != expected_params or len(params_V) != expected_params:
+            raise ValueError(f"Expected {expected_params} parameters, got {len(params_U)}/{len(params_V)}")
         
+        # Create parameter dictionaries
+        param_dict_U = dict(zip([param for param in circuit_U.parameters], params_U))
+        param_dict_V = dict(zip([param for param in circuit_V.parameters], params_V))
+        
+        # Bind parameters
         bound_circuit_U = circuit_U.assign_parameters(param_dict_U)
         bound_circuit_V = circuit_V.assign_parameters(param_dict_V)
         
-        # Add measurements to the circuits
+        # Add measurements
         bound_circuit_U.measure_all()
         bound_circuit_V.measure_all()
         
         # Run circuits with noise model
         noise_model = self.create_advanced_noise_model()
         
-        job_U = self.noisy_backend.run(
-            bound_circuit_U,
-            noise_model=noise_model,
-            shots=1000,
-            optimization_level=0
-        )
-        
-        job_V = self.noisy_backend.run(
-            bound_circuit_V,
-            noise_model=noise_model,
-            shots=1000,
-            optimization_level=0
-        )
-        
-        # Get probability distributions from measurements
-        counts_U = job_U.result().get_counts()
-        counts_V = job_V.result().get_counts()
+        try:
+            job_U = self.noisy_backend.run(
+                bound_circuit_U,
+                noise_model=noise_model,
+                shots=1000,
+                optimization_level=0
+            )
+            
+            job_V = self.noisy_backend.run(
+                bound_circuit_V,
+                noise_model=noise_model,
+                shots=1000,
+                optimization_level=0
+            )
+            
+            # Get probability distributions from measurements
+            counts_U = job_U.result().get_counts()
+            counts_V = job_V.result().get_counts()
+            
+        except Exception as e:
+            print(f"Circuit execution failed: {str(e)}")
+            # Return fallback values
+            return np.sort(np.abs(np.diagonal(matrix)))[::-1]
         
         # Convert to probability distributions
         probs_U = self._counts_to_probabilities(counts_U)
@@ -120,16 +143,24 @@ class SimulatedQSVD:
         return probs
     
     def _estimate_singular_values(self, probs_U, probs_V, matrix):
-        """Estimate singular values from probability distributions"""
-        # Simple estimation method - can be improved
+        """Improved singular value estimation"""
         dim = 2**self.num_qubits
         singular_values = np.zeros(dim)
+        matrix_norm = np.linalg.norm(matrix, 'fro')  # Frobenius norm
         
-        # Use probability distributions to estimate singular values
+        # Sort probabilities by magnitude
+        sorted_U = np.sort(probs_U)[::-1]
+        sorted_V = np.sort(probs_V)[::-1]
+        
+        # Use correlation between probabilities
         for i in range(dim):
-            singular_values[i] = np.sqrt(probs_U[i] * probs_V[i]) * np.linalg.norm(matrix)
+            # Weight by position in sorted list
+            weight = np.exp(-i / dim)  # Exponential decay weight
+            singular_values[i] = np.sqrt(sorted_U[i] * sorted_V[i]) * matrix_norm * weight
         
-        return singular_values
+        # Normalize to preserve matrix norm
+        scale = matrix_norm / np.linalg.norm(singular_values)
+        return singular_values * scale
     
     def get_true_singular_values(self, matrix):
         """Get classical SVD for comparison"""

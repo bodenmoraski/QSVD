@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from scipy.linalg import svd as classical_svd
-from simqsvd import SimulatedQSVD
+from simqsvd import SimulatedQSVD, PerformanceMonitor
 
 class SimulatedQuantumEnv:
     """
@@ -44,7 +44,10 @@ class SimulatedQuantumEnv:
         self.params_per_circuit = self.num_qubits * (1 + self.circuit_depth) * 3
         
         # Initialize QSVD simulator with noise parameters
-        self.qsvd_sim = SimulatedQSVD(num_qubits, circuit_depth)
+        self.qsvd_sim = SimulatedQSVD(num_qubits, circuit_depth, self.noise_params)
+        
+        # Calculate number of parameters per circuit
+        self.params_per_circuit = num_qubits * circuit_depth
         
         # Generate random matrix
         self.matrix = np.random.rand(2**num_qubits, 2**num_qubits) + \
@@ -136,52 +139,76 @@ class PPOAgent(nn.Module):
 
 def train_agent(episodes=1000, num_qubits=4, circuit_depth=4, noise_params=None):
     """
-    Train the PPO agent to reduce noise in simulated QSVD
+    Train the PPO agent with enhanced monitoring and debugging
     """
-    # Create environment
+    # Create environment and monitoring tools
     env = SimulatedQuantumEnv(num_qubits, circuit_depth, noise_params)
+    performance_monitor = PerformanceMonitor()
     
-    # Calculate correct dimensions
-    state_dim = 2**num_qubits + 1  # singular values + noise level
-    action_dim = env.params_per_circuit * 2  # Parameters for both U and V circuits
+    # Initialize tracking metrics
+    state_dim = 2**num_qubits + 1
+    action_dim = num_qubits * circuit_depth * 2
     
     # Initialize agent with correct dimensions
     agent = PPOAgent(state_dim, action_dim)
     optimizer = optim.Adam(agent.parameters(), lr=3e-4)
     
-    rewards_history = []
-    error_history = []
-    noise_history = []  # Track noise levels over time
+    # Enhanced history tracking
+    training_metrics = {
+        'rewards': [],
+        'errors': [],
+        'noise_levels': [],
+        'circuit_quality': [],
+        'gradient_stats': [],
+        'fidelity_history': []
+    }
     
     for episode in range(episodes):
         state = env.reset()
         episode_reward = 0
         
-        # Collect experience
+        # Collect experience with enhanced monitoring
         action, log_prob = agent.select_action(state)
         next_state, reward, done, info = env.step(action)
         
-        # Convert reward to PyTorch tensor
-        loss = -torch.tensor(reward, requires_grad=True)
+        # Monitor circuit quality
+        circuit_metrics = env.qsvd_sim.analyze_circuit_quality(
+            env.qsvd_sim.circuit_U,
+            env.qsvd_sim.circuit_V,
+            action
+        )
         
-        # Update agent
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # Update performance monitor
+        performance_monitor.update(
+            info['noisy_values'],
+            info['true_values'],
+            next_state,
+            env.noise_level
+        )
         
-        # Record history (using numpy for storage)
-        rewards_history.append(float(reward))
-        error = np.mean(np.abs(info['noisy_values'] - info['true_values']))
-        error_history.append(error)
-        noise_history.append(info.get('noise_level', 0))
+        # Record detailed metrics
+        training_metrics['rewards'].append(float(reward))
+        training_metrics['errors'].append(np.mean(np.abs(info['noisy_values'] - info['true_values'])))
+        training_metrics['noise_levels'].append(env.noise_level)
+        training_metrics['circuit_quality'].append(circuit_metrics)
+        training_metrics['fidelity_history'].append(info['quantum_fidelity'])
         
-        if episode % 100 == 0:
-            avg_reward = np.mean(rewards_history[-100:]) if episode >= 100 else np.mean(rewards_history)
-            avg_error = np.mean(error_history[-100:]) if episode >= 100 else np.mean(error_history)
-            print(f"Episode {episode}")
-            print(f"Avg Reward: {avg_reward:.4f}")
-            print(f"Avg Error: {avg_error:.4f}")
-            print("Current Noise Parameters:")
+        # Detailed logging every N episodes
+        if episode % 50 == 0 and episode > 0:
+            perf_report = performance_monitor.generate_report()
+            print(f"\nEpisode {episode} Detailed Report:")
+            print("=" * 50)
+            print(f"Performance Metrics:")
+            print(f"  Average Error: {perf_report['avg_error']:.4f}")
+            print(f"  Fidelity Trend: {'Improving' if perf_report['fidelity_trend'] > 0 else 'Degrading'}")
+            print(f"  Noise-Error Correlation: {perf_report['noise_correlation']:.4f}")
+            
+            print("\nCircuit Quality Metrics:")
+            print(f"  Gradient Vanishing: {circuit_metrics['gradient_vanishing']}")
+            print(f"  Gradient Exploding: {circuit_metrics['gradient_exploding']}")
+            print(f"  Depth Efficiency: {circuit_metrics['depth_efficiency']:.4f}")
+            
+            print("\nNoise Analysis:")
             for key, value in env.noise_params.items():
                 if isinstance(value, dict):
                     print(f"  {key}:")
@@ -189,9 +216,72 @@ def train_agent(episodes=1000, num_qubits=4, circuit_depth=4, noise_params=None)
                         print(f"    {k}: {v}")
                 else:
                     print(f"  {key}: {value}")
+            
+            print("\nTraining Statistics:")
+            print(f"  Recent Reward Avg: {np.mean(training_metrics['rewards'][-50:]):.4f}")
+            print(f"  Recent Error Avg: {np.mean(training_metrics['errors'][-50:]):.4f}")
+            print(f"  Recent Fidelity Avg: {np.mean(training_metrics['fidelity_history'][-50:]):.4f}")
+            print("=" * 50)
+        
+        # Regular progress update
+        if episode % 100 == 0:
+            avg_reward = np.mean(training_metrics['rewards'][-100:]) if episode >= 100 else np.mean(training_metrics['rewards'])
+            avg_error = np.mean(training_metrics['errors'][-100:]) if episode >= 100 else np.mean(training_metrics['errors'])
+            print(f"\nEpisode {episode} Summary:")
+            print(f"Avg Reward: {avg_reward:.4f}")
+            print(f"Avg Error: {avg_error:.4f}")
             print("-" * 50)
     
-    return agent, rewards_history, error_history, noise_history
+    # Generate final plots
+    plot_training_metrics(training_metrics, save_path='detailed_training_results.png')
+    
+    return agent, training_metrics
+
+def plot_training_metrics(metrics, save_path):
+    """
+    Create detailed visualization of training metrics
+    """
+    plt.figure(figsize=(20, 10))
+    
+    # Rewards
+    plt.subplot(2, 3, 1)
+    plt.plot(metrics['rewards'])
+    plt.title('Training Rewards')
+    plt.xlabel('Episode')
+    plt.ylabel('Reward')
+    
+    # Errors
+    plt.subplot(2, 3, 2)
+    plt.plot(metrics['errors'])
+    plt.title('SVD Error Over Time')
+    plt.xlabel('Episode')
+    plt.ylabel('Mean Absolute Error')
+    
+    # Fidelity
+    plt.subplot(2, 3, 3)
+    plt.plot(metrics['fidelity_history'])
+    plt.title('Quantum Fidelity')
+    plt.xlabel('Episode')
+    plt.ylabel('Fidelity')
+    
+    # Circuit Quality
+    plt.subplot(2, 3, 4)
+    depth_efficiency = [m['depth_efficiency'] for m in metrics['circuit_quality']]
+    plt.plot(depth_efficiency)
+    plt.title('Circuit Depth Efficiency')
+    plt.xlabel('Episode')
+    plt.ylabel('Efficiency')
+    
+    # Noise Levels
+    plt.subplot(2, 3, 5)
+    plt.plot(metrics['noise_levels'])
+    plt.title('Noise Level Evolution')
+    plt.xlabel('Episode')
+    plt.ylabel('Noise Level')
+    
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
 
 if __name__ == "__main__":
     # Define custom noise parameters (optional)
@@ -209,35 +299,19 @@ if __name__ == "__main__":
         'control_frequency_drift': 0.006,
     }
     
-    # Train agent with advanced noise model
-    agent, rewards, errors, noise_levels = train_agent(
+    # Train agent with enhanced monitoring
+    agent, training_metrics = train_agent(
         episodes=1000,
         num_qubits=4,
         circuit_depth=4,
         noise_params=noise_params
     )
     
-    # Plot results with noise information
-    plt.figure(figsize=(15, 5))
-    
-    plt.subplot(1, 3, 1)
-    plt.plot(rewards)
-    plt.title('Training Rewards')
-    plt.xlabel('Episode')
-    plt.ylabel('Reward')
-    
-    plt.subplot(1, 3, 2)
-    plt.plot(errors)
-    plt.title('SVD Error Over Time')
-    plt.xlabel('Episode')
-    plt.ylabel('Mean Absolute Error')
-    
-    plt.subplot(1, 3, 3)
-    plt.plot(noise_levels)
-    plt.title('Noise Level Over Time')
-    plt.xlabel('Episode')
-    plt.ylabel('Noise Level')
-    
-    plt.tight_layout()
-    plt.savefig('training_results.png')
-    plt.close()
+    # Generate final report
+    print("\nFinal Training Report")
+    print("=" * 50)
+    print(f"Final Average Reward: {np.mean(training_metrics['rewards'][-100:]):.4f}")
+    print(f"Final Average Error: {np.mean(training_metrics['errors'][-100:]):.4f}")
+    print(f"Final Average Fidelity: {np.mean(training_metrics['fidelity_history'][-100:]):.4f}")
+    print(f"Training Stability: {np.std(training_metrics['rewards'][-100:]):.4f}")
+    print("=" * 50)

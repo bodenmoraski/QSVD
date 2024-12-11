@@ -104,6 +104,10 @@ class SimulatedQSVD:
     def simulate_svd(self, matrix, params_U, params_V):
         """Simulate QSVD using state vector simulation"""
         try:
+            print("Debug - Input parameters:")
+            print(f"params_U first few values: {params_U[:5]}")
+            print(f"params_V first few values: {params_V[:5]}")
+            
             # Validate matrix dimensions
             if matrix.shape[0] != 2**self.num_qubits or matrix.shape[1] != 2**self.num_qubits:
                 raise ValueError(f"Matrix dimensions must be {2**self.num_qubits}x{2**self.num_qubits}")
@@ -144,6 +148,11 @@ class SimulatedQSVD:
             # Estimate singular values
             singular_values = self._estimate_singular_values(probs_U, probs_V, matrix)
             
+            print("Debug - Circuit outputs:")
+            print(f"First few counts_U: {list(counts_U.items())[:3]}")
+            print(f"First few probs_U: {probs_U[:3]}")
+            print(f"Resulting singular values: {singular_values[:3]}")
+            
             return np.sort(singular_values)[::-1]
             
         except Exception as e:
@@ -157,23 +166,35 @@ class SimulatedQSVD:
         probs = np.zeros(dim)
         
         for bitstring, count in counts.items():
-            # Remove any spaces from the bitstring
-            bitstring = bitstring.replace(' ', '')
+            # Debug print
+            print(f"Processing bitstring: {bitstring}, count: {count}")
+            
+            # Remove spaces and get only the relevant bits
+            clean_bitstring = bitstring.replace(' ', '')
             try:
-                # Ensure we only take the last num_qubits bits
-                # This handles cases where the bitstring might be longer than expected
-                index = int(bitstring[-self.num_qubits:], 2)
-                if index < dim:  # Add safety check
+                # Split on '0000' and take first part
+                relevant_bits = clean_bitstring.split('0000')[0]
+                # Convert to index
+                index = int(relevant_bits, 2) if relevant_bits else 0
+                print(f"Converted to index: {index}")
+                
+                if index < dim:
                     probs[index] = count / total_shots
-                else:
-                    print(f"Warning: Computed index {index} exceeds dimension {dim}, skipping")
-            except ValueError as e:
-                print(f"Warning: Invalid bitstring {bitstring}, skipping")
+                    
+            except (ValueError, IndexError) as e:
+                print(f"Error processing bitstring {bitstring}: {e}")
                 continue
         
-        # Normalize probabilities if they don't sum to 1
-        if np.sum(probs) > 0:
-            probs = probs / np.sum(probs)
+        # Debug print before normalization
+        print(f"Pre-normalization probabilities: {probs}")
+        
+        # Normalize probabilities
+        total_prob = np.sum(probs)
+        if total_prob > 0:
+            probs = probs / total_prob
+        
+        # Debug print after normalization
+        print(f"Final probabilities: {probs}")
         
         return probs
     

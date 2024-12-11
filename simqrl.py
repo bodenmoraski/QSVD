@@ -15,8 +15,23 @@ class SimulatedQuantumEnv:
         self.num_qubits = num_qubits
         self.circuit_depth = circuit_depth
         
+        # Store noise_params as instance variable
+        self.noise_params = noise_params or {
+            't1': 45e-6,
+            't2': 65e-6,
+            'gate_times': {
+                'single': 25e-9,
+                'two': 45e-9,
+            },
+            'thermal_population': 0.015,
+            'readout_error': 0.025,
+            'crosstalk_strength': 0.035,
+            'control_amplitude_error': 0.015,
+            'control_frequency_drift': 0.006,
+        }
+        
         # Add noise_level initialization
-        self.noise_level = noise_params.get('readout_error', 0.025) if noise_params else 0.025
+        self.noise_level = self.noise_params.get('readout_error', 0.025)
         
         # Calculate total parameters needed
         self.params_per_circuit = num_qubits * (1 + circuit_depth) * 3
@@ -104,35 +119,69 @@ class SimulatedQuantumEnv:
         return np.concatenate([noisy_initial, [self.noise_level]])
 
 class PPOAgent(nn.Module):
-    """
-    PPO agent optimized for noise reduction in simulated QSVD
-    """
     def __init__(self, state_dim, action_dim):
         super(PPOAgent, self).__init__()
-        # action_dim already accounts for both U and V parameters
         self.action_dim = action_dim
         
-        # Increase network capacity
-        self.fc1 = nn.Linear(state_dim, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, self.action_dim)
+        # Replace batch normalization with layer normalization
+        self.fc1 = nn.Linear(state_dim, 128)
+        self.ln1 = nn.LayerNorm(128)
+        self.fc2 = nn.Linear(128, 128)
+        self.ln2 = nn.LayerNorm(128)
+        self.fc3 = nn.Linear(128, self.action_dim)
         
-        # Initialize with small values
-        self.log_std = nn.Parameter(torch.ones(self.action_dim) * -0.5)
+        # Initialize with smaller values
+        self.log_std = nn.Parameter(torch.ones(self.action_dim) * -2.0)
         
+        # Initialize weights with smaller values
+        for layer in [self.fc1, self.fc2, self.fc3]:
+            nn.init.orthogonal_(layer.weight, gain=0.1)
+            nn.init.constant_(layer.bias, 0.0)
+    
     def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
+        # Add checks for NaN
+        if torch.isnan(state).any():
+            print("Warning: NaN detected in input state")
+            state = torch.nan_to_num(state, 0.0)
+        
+        # Ensure state is properly shaped
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+            
+        x = F.relu(self.ln1(self.fc1(state)))
+        x = F.relu(self.ln2(self.fc2(x)))
         mean = torch.tanh(self.fc3(x)) * np.pi  # Bound outputs to [-π, π]
-        std = self.log_std.exp().clamp(min=1e-6, max=1)
-        return mean, std
+        
+        # Ensure std is positive and not too small
+        std = torch.clamp(self.log_std.exp(), min=1e-4, max=1.0)
+        
+        # Check for NaN
+        if torch.isnan(mean).any() or torch.isnan(std).any():
+            print("Warning: NaN detected in network output")
+            mean = torch.nan_to_num(mean, 0.0)
+            std = torch.nan_to_num(std, 1e-4)
+        
+        return mean.squeeze(0), std
     
     def select_action(self, state):
-        state = torch.FloatTensor(state)
-        mean, std = self.forward(state)
-        dist = torch.distributions.Normal(mean, std)
-        action = dist.sample()
-        return action.detach().numpy(), dist.log_prob(action).sum().item()
+        with torch.no_grad():
+            state = torch.FloatTensor(state)
+            mean, std = self.forward(state)
+            
+            # Safety checks
+            if torch.isnan(mean).any() or torch.isnan(std).any():
+                print("Warning: NaN detected before action selection")
+                mean = torch.zeros_like(mean)
+                std = torch.ones_like(std)
+            
+            try:
+                dist = torch.distributions.Normal(mean, std)
+                action = dist.sample()
+                return action.detach().numpy(), dist.log_prob(action).sum().item()
+            except ValueError as e:
+                print(f"Error in action selection: {e}")
+                # Return safe fallback values
+                return np.zeros(self.action_dim), 0.0
 
 def train_agent(episodes=1000, num_qubits=4, circuit_depth=4, noise_params=None):
     """

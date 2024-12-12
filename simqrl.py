@@ -210,6 +210,15 @@ def train_agent(episodes=1000, num_qubits=4, circuit_depth=4, noise_params=None)
         'fidelity_history': []
     }
     
+    # Initialize circuit metrics
+    circuit_metrics = {
+        'gradient_vanishing': False,
+        'gradient_exploding': False,
+        'depth_efficiency': 1.0,
+        'parameter_norm': 0.0,
+        'gradient_norm': 0.0
+    }
+    
     for episode in range(episodes):
         state = env.reset()
         episode_reward = 0
@@ -218,19 +227,55 @@ def train_agent(episodes=1000, num_qubits=4, circuit_depth=4, noise_params=None)
         action, log_prob = agent.select_action(state)
         next_state, reward, done, info = env.step(action)
         
-        # Monitor circuit quality (only pass action)
+        # Update circuit metrics
+        with torch.no_grad():
+            # Calculate parameter norms
+            param_norm = sum(p.norm().item() for p in agent.parameters())
+            grad_norm = sum(p.grad.norm().item() if p.grad is not None else 0 
+                          for p in agent.parameters())
+            
+            circuit_metrics.update({
+                'gradient_vanishing': grad_norm < 1e-7,
+                'gradient_exploding': grad_norm > 1e3,
+                'depth_efficiency': 1.0 / circuit_depth,  # Simple metric, could be more sophisticated
+                'parameter_norm': param_norm,
+                'gradient_norm': grad_norm
+            })
+        
+        # Only print detailed info every 50 episodes
         if episode % 50 == 0:
-            try:
-                # Pass only the action vector
-                circuit_metrics = env.qsvd_sim.analyze_circuit_quality(action)
-                training_metrics['circuit_quality'].append(circuit_metrics)
-            except Exception as e:
-                print(f"Warning: Circuit analysis failed: {str(e)}")
-                training_metrics['circuit_quality'].append({
-                    'gradient_vanishing': False,
-                    'gradient_exploding': False,
-                    'depth_efficiency': 0.5
-                })
+            print(f"\nEpisode {episode} Details:")
+            print("=" * 50)
+            
+            # Circuit Parameters
+            print("\nCircuit Configuration:")
+            print(f"  Number of qubits: {num_qubits}")
+            print(f"  Circuit depth: {circuit_depth}")
+            
+            # Singular Values Comparison
+            true_values = info.get('true_values', [])
+            noisy_values = info.get('noisy_values', [])
+            print("\nSingular Values:")
+            print("  True      Noisy     Error(%)")
+            print("-" * 35)
+            for true, noisy in zip(true_values, noisy_values):
+                error_pct = abs(true - noisy) / true * 100 if true != 0 else 0
+                print(f"  {true:8.4f} {noisy:8.4f} {error_pct:8.2f}%")
+            
+            # Performance Metrics
+            current_error = np.mean(np.abs(np.array(true_values) - np.array(noisy_values)))
+            print("\nPerformance Metrics:")
+            print(f"  Current Error: {current_error:.4f}")
+            print(f"  Recent Reward: {reward:.4f}")
+            print(f"  Fidelity: {info.get('quantum_fidelity', 0):.4f}")
+            
+            # Noise Analysis
+            if noise_params:
+                print("\nNoise Parameters:")
+                for param, value in noise_params.items():
+                    print(f"  {param}: {value}")
+            
+            print("=" * 50)
         
         # Update performance monitor
         performance_monitor.update(

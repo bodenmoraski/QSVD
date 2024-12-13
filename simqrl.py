@@ -6,6 +6,7 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 from scipy.linalg import svd as classical_svd
 from simqsvd import SimulatedQSVD, PerformanceMonitor
+from running_mean_std import RunningMeanStd
 
 class SimulatedQuantumEnv:
     '''
@@ -14,6 +15,12 @@ class SimulatedQuantumEnv:
     def __init__(self, num_qubits, circuit_depth, noise_params=None):
         self.num_qubits = num_qubits
         self.circuit_depth = circuit_depth
+        
+        # Calculate dimensions
+        self.matrix_dim = 2**num_qubits
+        
+        # Define observation space shape (singular values + noise level)
+        self.observation_shape = (self.matrix_dim + 1,)  # +1 for noise level
         
         # Store noise_params as instance variable
         self.noise_params = noise_params or {
@@ -38,7 +45,6 @@ class SimulatedQuantumEnv:
         self.total_params = self.params_per_circuit * 2  # For both U and V
         
         # Initialize matrix with correct dimensions
-        self.matrix_dim = 2**num_qubits
         self.matrix = np.random.rand(self.matrix_dim, self.matrix_dim) + \
                      1j * np.random.rand(self.matrix_dim, self.matrix_dim)
         
@@ -47,6 +53,10 @@ class SimulatedQuantumEnv:
         
         # Get true singular values
         self.true_singular_values = np.sort(np.abs(np.linalg.svd(self.matrix)[1]))[::-1]
+        
+        # Initialize running statistics for normalization
+        self.running_mean = RunningMeanStd(shape=self.observation_shape)
+        self.running_reward = RunningMeanStd(shape=())
     
     def step(self, action):
         try:
@@ -75,6 +85,10 @@ class SimulatedQuantumEnv:
             
             # State includes singular values and noise information
             state = np.concatenate([noisy_values, [self.qsvd_sim.noise_level]])
+            
+            # Normalize state and reward
+            state = self.running_mean.normalize(state)
+            reward = self.running_reward.normalize(reward)
             
             return state, reward, False, {
                 'true_values': self.true_singular_values,
@@ -121,47 +135,36 @@ class SimulatedQuantumEnv:
 class PPOAgent(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(PPOAgent, self).__init__()
-        self.action_dim = action_dim
         
-        # Replace batch normalization with layer normalization
-        self.fc1 = nn.Linear(state_dim, 128)
-        self.ln1 = nn.LayerNorm(128)
-        self.fc2 = nn.Linear(128, 128)
-        self.ln2 = nn.LayerNorm(128)
-        self.fc3 = nn.Linear(128, self.action_dim)
+        # 1. Use residual connections
+        self.fc1 = nn.Linear(state_dim, 256)  # Wider layers
+        self.ln1 = nn.LayerNorm(256)
         
-        # Initialize with smaller values
-        self.log_std = nn.Parameter(torch.ones(self.action_dim) * -2.0)
+        # 2. Add residual connection
+        self.fc2 = nn.Linear(256, 256)
+        self.ln2 = nn.LayerNorm(256)
         
-        # Initialize weights with smaller values
+        self.fc3 = nn.Linear(256, action_dim)
+        
+        # 3. Better initialization
         for layer in [self.fc1, self.fc2, self.fc3]:
-            nn.init.orthogonal_(layer.weight, gain=0.1)
+            nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
             nn.init.constant_(layer.bias, 0.0)
+        
+        # 4. Adaptive log_std
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
     
     def forward(self, state):
-        # Add checks for NaN
-        if torch.isnan(state).any():
-            print("Warning: NaN detected in input state")
-            state = torch.nan_to_num(state, 0.0)
-        
-        # Ensure state is properly shaped
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
-            
+        # Add residual connections
         x = F.relu(self.ln1(self.fc1(state)))
+        identity = x
         x = F.relu(self.ln2(self.fc2(x)))
-        mean = torch.tanh(self.fc3(x)) * np.pi  # Bound outputs to [-π, π]
+        x = x + identity  # Residual connection
         
-        # Ensure std is positive and not too small
-        std = torch.clamp(self.log_std.exp(), min=1e-4, max=1.0)
+        mean = torch.tanh(self.fc3(x)) * np.pi
+        std = torch.clamp(self.log_std.exp(), min=1e-6, max=1.0)
         
-        # Check for NaN
-        if torch.isnan(mean).any() or torch.isnan(std).any():
-            print("Warning: NaN detected in network output")
-            mean = torch.nan_to_num(mean, 0.0)
-            std = torch.nan_to_num(std, 1e-4)
-        
-        return mean.squeeze(0), std
+        return mean, std
     
     def select_action(self, state):
         with torch.no_grad():
@@ -198,7 +201,20 @@ def train_agent(episodes=1000, num_qubits=4, circuit_depth=4, noise_params=None)
     
     # Initialize agent with correct dimensions
     agent = PPOAgent(state_dim, action_dim)
-    optimizer = optim.Adam(agent.parameters(), lr=3e-4)
+    optimizer = optim.AdamW(
+        agent.parameters(),
+        lr=3e-4,
+        weight_decay=0.01,  # L2 regularization
+        betas=(0.9, 0.999)
+    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='max',
+        factor=0.5,
+        patience=50,
+        verbose=True
+    )
+    max_grad_norm = 0.5
     
     # Enhanced history tracking
     training_metrics = {
@@ -329,6 +345,25 @@ def train_agent(episodes=1000, num_qubits=4, circuit_depth=4, noise_params=None)
             print(f"Avg Reward: {avg_reward:.4f}")
             print(f"Avg Error: {avg_error:.4f}")
             print("-" * 50)
+        
+        # Implement gradient clipping
+        torch.nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
+        
+        # Track gradients for monitoring
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            agent.parameters(), 
+            float('inf')
+        ).item()
+        
+        # Update circuit metrics with gradient info
+        circuit_metrics.update({
+            'gradient_vanishing': grad_norm < 1e-7,
+            'gradient_exploding': grad_norm > 1e3,
+            'gradient_norm': grad_norm
+        })
+        
+        # Update learning rate based on performance
+        scheduler.step(reward)
     
     # Generate final plots
     plot_training_metrics(training_metrics, save_path='detailed_training_results.png')
@@ -380,6 +415,26 @@ def plot_training_metrics(metrics, save_path):
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
+
+class RunningMeanStd:
+    def __init__(self, shape):
+        self.mean = np.zeros(shape)
+        self.std = np.ones(shape)
+        self.count = 1e-4
+        
+    def update(self, x):
+        batch_mean = np.mean(x, axis=0)
+        batch_std = np.std(x, axis=0)
+        batch_count = x.shape[0]
+        
+        delta = batch_mean - self.mean
+        self.mean += delta * batch_count / (self.count + batch_count)
+        self.std = np.sqrt(self.std**2 + batch_std**2 + delta**2 * 
+                          self.count * batch_count / (self.count + batch_count))
+        self.count += batch_count
+        
+    def normalize(self, x):
+        return (x - self.mean) / (self.std + 1e-8)
 
 if __name__ == "__main__":
     try:

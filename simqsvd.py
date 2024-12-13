@@ -104,9 +104,11 @@ class SimulatedQSVD:
     def simulate_svd(self, matrix, params_U, params_V):
         """Simulate QSVD using state vector simulation"""
         try:
+            '''
             print("Debug - Input parameters:")
             print(f"params_U first few values: {params_U[:5]}")
             print(f"params_V first few values: {params_V[:5]}")
+            '''
             
             # Validate matrix dimensions
             if matrix.shape[0] != 2**self.num_qubits or matrix.shape[1] != 2**self.num_qubits:
@@ -148,11 +150,12 @@ class SimulatedQSVD:
             # Estimate singular values
             singular_values = self._estimate_singular_values(probs_U, probs_V, matrix)
             
+            '''
             print("Debug - Circuit outputs:")
             print(f"First few counts_U: {list(counts_U.items())[:3]}")
             print(f"First few probs_U: {probs_U[:3]}")
             print(f"Resulting singular values: {singular_values[:3]}")
-            
+            '''
             return np.sort(singular_values)[::-1]
             
         except Exception as e:
@@ -167,7 +170,7 @@ class SimulatedQSVD:
         
         for bitstring, count in counts.items():
             # Debug print
-            print(f"Processing bitstring: {bitstring}, count: {count}")
+            #print(f"Processing bitstring: {bitstring}, count: {count}")
             
             # Remove spaces and get only the relevant bits
             clean_bitstring = bitstring.replace(' ', '')
@@ -176,7 +179,7 @@ class SimulatedQSVD:
                 relevant_bits = clean_bitstring.split('0000')[0]
                 # Convert to index
                 index = int(relevant_bits, 2) if relevant_bits else 0
-                print(f"Converted to index: {index}")
+                #print(f"Converted to index: {index}")
                 
                 if index < dim:
                     probs[index] = count / total_shots
@@ -186,7 +189,7 @@ class SimulatedQSVD:
                 continue
         
         # Debug print before normalization
-        print(f"Pre-normalization probabilities: {probs}")
+        #print(f"Pre-normalization probabilities: {probs}")
         
         # Normalize probabilities
         total_prob = np.sum(probs)
@@ -194,7 +197,7 @@ class SimulatedQSVD:
             probs = probs / total_prob
         
         # Debug print after normalization
-        print(f"Final probabilities: {probs}")
+        #print(f"Final probabilities: {probs}")
         
         return probs
     

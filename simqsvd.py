@@ -10,6 +10,275 @@ import time
 import psutil
 import qiskit
 
+class PerformanceMonitor:
+    """Monitor and analyze quantum circuit performance metrics"""
+    def __init__(self):
+        self.metrics = {
+            'circuit_fidelity': [],
+            'singular_value_error': [],
+            'noise_impact': [],
+            'execution_time': [],
+            'gradient_norms': [],
+            'parameter_norms': [],
+            'loss_values': [],
+            'state_norms': []
+        }
+        
+        self.debug_data = {
+            'gradient_vanishing_events': 0,
+            'gradient_exploding_events': 0,
+            'nan_events': 0,
+            'error_events': 0
+        }
+        
+        self.thresholds = {
+            'gradient_vanishing': 1e-5,
+            'gradient_exploding': 1e3,
+            'max_singular_value_error': 0.5
+        }
+        
+        self.start_time = time.time()
+
+    def update(self, noisy_values, true_values, state, noise_level):
+        """
+        Update monitor with new values from a training step
+        
+        Parameters:
+        -----------
+        noisy_values : np.ndarray
+            The noisy singular values from the quantum circuit
+        true_values : np.ndarray
+            The true singular values from classical computation
+        state : np.ndarray
+            The current state vector
+        noise_level : float
+            The current noise level
+        """
+        try:
+            # Calculate error metrics
+            error = np.mean(np.abs(noisy_values - true_values))
+            self.metrics['singular_value_error'].append(error)
+            
+            # Calculate state-based metrics
+            state_norm = np.linalg.norm(state)
+            self.metrics['state_norms'].append(state_norm)
+            
+            # Calculate noise impact
+            noise_impact = np.sum(np.abs(noisy_values - true_values)) / len(true_values)
+            self.metrics['noise_impact'].append(noise_impact)
+            
+            # Update execution time
+            self.metrics['execution_time'].append(time.time() - self.start_time)
+            
+            # Check for anomalies
+            if np.isnan(error):
+                self.debug_data['nan_events'] += 1
+            
+            if error > self.thresholds['max_singular_value_error']:
+                self.debug_data['error_events'] += 1
+                
+        except Exception as e:
+            print(f"Warning: Error updating metrics: {str(e)}")
+            self.debug_data['error_events'] += 1
+
+    def update_metrics(self, **kwargs):
+        """Update individual performance metrics"""
+        for key, value in kwargs.items():
+            if key in self.metrics:
+                self.metrics[key].append(value)
+                
+                # Check for anomalies
+                if key == 'gradient_norms':
+                    if abs(value) < self.thresholds['gradient_vanishing']:
+                        self.debug_data['gradient_vanishing_events'] += 1
+                    elif abs(value) > self.thresholds['gradient_exploding']:
+                        self.debug_data['gradient_exploding_events'] += 1
+                        
+                if np.isnan(value).any():
+                    self.debug_data['nan_events'] += 1
+
+    def generate_report(self):
+        """Generate a report of the current metrics"""
+        # Check if we have enough data points
+        if len(self.metrics['circuit_fidelity']) < 2:
+            return {
+                'avg_error': np.mean(self.metrics['singular_value_error']) if self.metrics['singular_value_error'] else 0.0,
+                'fidelity_trend': 0.0,  # Not enough data for gradient
+                'noise_correlation': 0.0  # Not enough data for correlation
+            }
+            
+        return {
+            'avg_error': np.mean(self.metrics['singular_value_error']),
+            'fidelity_trend': self._calculate_trend(self.metrics['circuit_fidelity']),
+            'noise_correlation': self._calculate_correlation(),
+            'debug_stats': {
+                'gradient_vanishing_events': self.debug_data['gradient_vanishing_events'],
+                'gradient_exploding_events': self.debug_data['gradient_exploding_events'],
+                'nan_events': self.debug_data['nan_events'],
+                'error_events': self.debug_data['error_events']
+            }
+        }
+
+    def _calculate_trend(self, data):
+        """Calculate trend with safety checks"""
+        if len(data) < 2:
+            return 0.0
+        try:
+            # Calculate simple difference for trend
+            # Positive value means improving, negative means degrading
+            recent_data = data[-10:]  # Look at recent history
+            return np.mean(np.diff(recent_data))
+        except Exception as e:
+            print(f"Warning: Error calculating trend: {str(e)}")
+            return 0.0
+
+    def _calculate_correlation(self):
+        """Calculate correlation with safety checks"""
+        try:
+            if len(self.metrics['noise_impact']) < 2:
+                return 0.0
+            return np.corrcoef(
+                self.metrics['noise_impact'], 
+                self.metrics['singular_value_error']
+            )[0,1]
+        except Exception as e:
+            print(f"Warning: Error calculating correlation: {str(e)}")
+            return 0.0
+
+    def reset(self):
+        """Reset all metrics"""
+        for key in self.metrics:
+            self.metrics[key] = []
+        for key in self.debug_data:
+            self.debug_data[key] = 0
+        self.start_time = time.time()
+
+    def get_summary(self):
+        """Get a summary of current performance"""
+        return {
+            'execution_time': time.time() - self.start_time,
+            'total_iterations': len(self.metrics['circuit_fidelity']),
+            'recent_fidelity': np.mean(self.metrics['circuit_fidelity'][-10:]) if self.metrics['circuit_fidelity'] else 0,
+            'gradient_health': {
+                'vanishing': self.debug_data['gradient_vanishing_events'],
+                'exploding': self.debug_data['gradient_exploding_events']
+            },
+            'error_rate': self.debug_data['error_events'] / max(1, len(self.metrics['circuit_fidelity']))
+        }
+
+class CircuitDebugger:
+    """Class for handling debug logging"""
+    def __init__(self):
+        self.log_history = []
+        self.error_count = 0
+        self.warning_count = 0
+        self.checkpoints = {}
+        self.start_time = time.time()
+
+    def log_checkpoint(self, name):
+        self.checkpoints[name] = {
+            'time': time.time() - self.start_time,
+            'memory': psutil.Process().memory_info().rss / 1024 / 1024
+        }
+
+    def log_parameters(self, params):
+        self.log_history.append({
+            'type': 'parameters',
+            'time': time.time() - self.start_time,
+            'params': str(params)
+        })
+
+    def log_state_vectors(self, name, state):
+        if state is not None:
+            self.log_history.append({
+                'type': 'state_vector',
+                'name': name,
+                'norm': np.linalg.norm(state),
+                'max_amp': np.max(np.abs(state)),
+                'min_amp': np.min(np.abs(state)),
+                'time': time.time() - self.start_time
+            })
+
+    def log_state_analysis(self, analysis):
+        self.log_history.append({
+            'type': 'state_analysis',
+            'time': time.time() - self.start_time,
+            'analysis': analysis
+        })
+
+    def log_distributions(self, distributions):
+        self.log_history.append({
+            'type': 'distributions',
+            'time': time.time() - self.start_time,
+            'distributions': {
+                k: {
+                    'mean': np.mean(v),
+                    'std': np.std(v),
+                    'min': np.min(v),
+                    'max': np.max(v)
+                } for k, v in distributions.items()
+            }
+        })
+
+    def log_matrix_properties(self, properties):
+        self.log_history.append({
+            'type': 'matrix_properties',
+            'time': time.time() - self.start_time,
+            'properties': properties
+        })
+
+    def log_computation(self, details):
+        self.log_history.append({
+            'type': 'computation',
+            'time': time.time() - self.start_time,
+            'details': details
+        })
+
+    def log_metric(self, name, value):
+        self.log_history.append({
+            'type': 'metric',
+            'name': name,
+            'value': value,
+            'time': time.time() - self.start_time
+        })
+
+    def log_error(self, message):
+        self.error_count += 1
+        self.log_history.append({
+            'type': 'error',
+            'message': message,
+            'time': time.time() - self.start_time
+        })
+
+    def log_warning(self, message):
+        self.warning_count += 1
+        self.log_history.append({
+            'type': 'warning',
+            'message': message,
+            'time': time.time() - self.start_time
+        })
+
+    def generate_debug_report(self):
+        """Generate a comprehensive debug report"""
+        report = ["Debug Report", "=" * 50, "\n"]
+        
+        # Error and Warning Summary
+        report.append(f"Errors: {self.error_count}")
+        report.append(f"Warnings: {self.warning_count}\n")
+        
+        # Checkpoint Timeline
+        report.append("Checkpoint Timeline:")
+        for name, data in self.checkpoints.items():
+            report.append(f"  {name}: {data['time']:.3f}s (Memory: {data['memory']:.1f}MB)")
+        
+        # Recent Events
+        report.append("\nRecent Events:")
+        recent_events = self.log_history[-10:]  # Last 10 events
+        for event in recent_events:
+            report.append(f"  {event['type']}: {event.get('message', '')}")
+        
+        return "\n".join(report)
+
 class SimulatedQSVD:
     """
     Simulated Quantum SVD with realistic noise models using Qiskit
@@ -48,6 +317,21 @@ class SimulatedQSVD:
         self.circuit_U = self.create_parameterized_circuit('U', 'circuit_U')
         self.circuit_V = self.create_parameterized_circuit('V', 'circuit_V')
         
+        self.debug_metrics = {
+            'gradient_history': [],
+            'parameter_history': [],
+            'fidelity_raw': [],
+            'singular_value_history': [],
+            'circuit_state_norms': [],
+            'probability_distributions': [],
+            'noise_impact_metrics': {}
+        }
+        self.debug_logger = CircuitDebugger()
+        
+        # Calculate total parameters
+        params_per_circuit = num_qubits * (1 + circuit_depth) * 3  # From create_parameterized_circuit method
+        self.total_parameters = params_per_circuit * 2  # For both U and V circuits
+
     def _create_noise_model(self, t1=50e-6, t2=70e-6, gate_time=20e-9):
         """Create a realistic noise model using Qiskit"""
         noise_model = NoiseModel()
@@ -202,24 +486,61 @@ class SimulatedQSVD:
         return probs
     
     def _estimate_singular_values(self, probs_U, probs_V, matrix):
-        """Improved singular value estimation"""
-        dim = 2**self.num_qubits
-        singular_values = np.zeros(dim)
-        matrix_norm = np.linalg.norm(matrix, 'fro')  # Frobenius norm
-        
-        # Sort probabilities by magnitude
-        sorted_U = np.sort(probs_U)[::-1]
-        sorted_V = np.sort(probs_V)[::-1]
-        
-        # Use correlation between probabilities
-        for i in range(dim):
-            # Weight by position in sorted list
-            weight = np.exp(-i / dim)  # Exponential decay weight
-            singular_values[i] = np.sqrt(sorted_U[i] * sorted_V[i]) * matrix_norm * weight
-        
-        # Normalize to preserve matrix norm
-        scale = matrix_norm / np.linalg.norm(singular_values)
-        return singular_values * scale
+        """Enhanced singular value estimation with debugging"""
+        try:
+            # Log input probabilities
+            self.debug_logger.log_distributions({
+                'probs_U': probs_U,
+                'probs_V': probs_V
+            })
+            
+            dim = 2**self.num_qubits
+            singular_values = np.zeros(dim)
+            matrix_norm = np.linalg.norm(matrix, 'fro')
+            
+            # Log matrix properties
+            self.debug_logger.log_matrix_properties({
+                'matrix_norm': matrix_norm,
+                'matrix_rank': np.linalg.matrix_rank(matrix),
+                'condition_number': np.linalg.cond(matrix)
+            })
+            
+            # Sort probabilities with logging
+            sorted_U = np.sort(probs_U)[::-1]
+            sorted_V = np.sort(probs_V)[::-1]
+            
+            self.debug_logger.log_distributions({
+                'sorted_U': sorted_U,
+                'sorted_V': sorted_V
+            })
+            
+            # Enhanced singular value computation
+            for i in range(dim):
+                weight = np.exp(-i / dim)
+                sv = np.sqrt(sorted_U[i] * sorted_V[i]) * matrix_norm * weight
+                singular_values[i] = sv
+                
+                # Log each singular value computation
+                self.debug_logger.log_computation({
+                    'index': i,
+                    'U_prob': sorted_U[i],
+                    'V_prob': sorted_V[i],
+                    'weight': weight,
+                    'singular_value': sv
+                })
+            
+            # Normalize with logging
+            scale = matrix_norm / np.linalg.norm(singular_values)
+            self.debug_logger.log_metric('normalization_scale', scale)
+            
+            final_values = singular_values * scale
+            self.debug_metrics['singular_value_history'].append(final_values)
+            
+            return final_values
+            
+        except Exception as e:
+            self.debug_logger.log_error(f"Singular value estimation failed: {str(e)}")
+            return np.zeros(2**self.num_qubits)
     
     def get_true_singular_values(self, matrix):
         """Get classical SVD for comparison"""
@@ -356,39 +677,24 @@ class SimulatedQSVD:
             }
     
     def _compute_parameter_gradients(self, circuit, params):
-        """
-        Compute parameter gradients for a circuit
-        """
-        try:
-            # Simple finite difference approximation
-            epsilon = 1e-7
-            gradients = []
+        """Simplified, robust gradient computation"""
+        epsilon = 1e-2  # Larger epsilon for numerical stability
+        grads = []
+        
+        for i in range(len(params)):
+            params_plus = params.copy()
+            params_plus[i] += epsilon
             
-            for i in range(len(params)):
-                params_plus = params.copy()
-                params_plus[i] += epsilon
-                
-                params_minus = params.copy()
-                params_minus[i] -= epsilon
-                
-                # Bind parameters and compute difference
-                param_dict_plus = dict(zip(circuit.parameters, params_plus))
-                param_dict_minus = dict(zip(circuit.parameters, params_minus))
-                
-                circuit_plus = circuit.assign_parameters(param_dict_plus)
-                circuit_minus = circuit.assign_parameters(param_dict_minus)
-                
-                # Compute gradient using finite difference
-                grad = (self._evaluate_circuit(circuit_plus) - 
-                       self._evaluate_circuit(circuit_minus)) / (2 * epsilon)
-                
-                gradients.append(grad)
+            params_minus = params.copy()
+            params_minus[i] -= epsilon
             
-            return np.array(gradients)
+            val_plus = self._evaluate_circuit(circuit.bind_parameters(params_plus))
+            val_minus = self._evaluate_circuit(circuit.bind_parameters(params_minus))
             
-        except Exception as e:
-            print(f"Warning: Error computing gradients: {str(e)}")
-            return np.zeros(len(params))
+            grad = (val_plus - val_minus) / (2 * epsilon)
+            grads.append(grad)
+        
+        return np.array(grads)
     
     def _calculate_depth_efficiency(self, circuit_U, circuit_V):
         """
@@ -402,61 +708,70 @@ class SimulatedQSVD:
             # Efficiency = 1 / (normalized_depth * params_per_layer)
             efficiency = 1.0 / (total_depth * (total_params / total_depth))
             
-            return min(1.0, max(0.0, efficiency))
+            return min(1.0, -+(0.0, efficiency))
             
         except Exception as e:
             print(f"Warning: Error calculating depth efficiency: {str(e)}")
             return 0.5
     
     def _evaluate_circuit(self, circuit):
-        """Evaluate circuit output for gradient calculation using statevector"""
+        """Enhanced circuit evaluation with debugging"""
         try:
-            # Ensure all parameters are bound
-            if circuit.parameters:
-                print(f"Warning: Circuit has unbound parameters: {circuit.parameters}")
-                return 0.0
+            # Add debugging checkpoint
+            self.debug_logger.log_checkpoint('circuit_evaluation_start')
             
             # Create a new statevector simulator
             backend = AerSimulator(method='statevector')
+            
+            # Debug print for circuit parameters
+            if circuit.parameters:
+                self.debug_logger.log_parameters(circuit.parameters)
             
             # Execute without measurements
             circuit_no_meas = circuit.copy()
             circuit_no_meas.remove_final_measurements()
             
-            # Add save instruction with the correct number of qubits
+            # Add state vector saving
             from qiskit_aer.library import SaveStatevector
-            save_sv = SaveStatevector(num_qubits=circuit.num_qubits)  # Specify num_qubits
+            save_sv = SaveStatevector(num_qubits=circuit.num_qubits)
             circuit_no_meas.append(save_sv, circuit_no_meas.qubits)
             
-            # Run simulation
+            # Run simulation with detailed metadata
             job = backend.run(
                 circuit_no_meas,
                 shots=1,
-                seed_simulator=42  # For reproducibility
+                seed_simulator=42,
+                metadata={'debug_mode': True}
             )
             
             try:
                 result = job.result()
-                # Get statevector
                 statevector = result.data().get('statevector')
                 
                 if statevector is not None:
+                    # Log state vector properties
+                    self.debug_metrics['circuit_state_norms'].append(np.linalg.norm(statevector))
+                    
+                    # Detailed state analysis
+                    state_analysis = {
+                        'norm': np.linalg.norm(statevector),
+                        'max_amplitude': np.max(np.abs(statevector)),
+                        'non_zero_states': np.count_nonzero(np.abs(statevector) > 1e-10)
+                    }
+                    self.debug_logger.log_state_analysis(state_analysis)
+                    
                     zero_state_amplitude = statevector[0]
                     return np.abs(zero_state_amplitude)**2
                 else:
-                    print("Warning: No statevector found in result")
-                    print(f"Available data keys: {list(result.data().keys())}")
+                    self.debug_logger.log_error("No statevector in result")
                     return 0.0
-                
+                    
             except Exception as inner_e:
-                print(f"Warning: Error getting statevector: {str(inner_e)}")
-                if 'result' in locals():
-                    print(f"Available data keys: {list(result.data().keys())}")
+                self.debug_logger.log_error(f"Statevector extraction failed: {str(inner_e)}")
                 return 0.0
-            
+                
         except Exception as e:
-            print(f"Warning: Error evaluating circuit: {str(e)}")
-            print(f"Circuit details: {circuit}")
+            self.debug_logger.log_error(f"Circuit evaluation failed: {str(e)}")
             return 0.0
     
     def _calculate_theoretical_impact(self, error_model):
@@ -496,155 +811,63 @@ class SimulatedQSVD:
             print(f"Warning: Error calculating theoretical impact: {str(e)}")
             # Return a default impact value
             return 0.01
-
-class ErrorTracker:
-    def __init__(self):
-        self.stages = []
-        self.errors = []
-        self.timings = {}
-        self.start_time = None
     
-    def __enter__(self):
-        """Support for context manager protocol"""
-        self.start_time = time.time()
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Support for context manager protocol"""
-        self.end_time = time.time()
-        if exc_type is not None:
-            self.log_error(exc_val)
-        return False  # Don't suppress exceptions
-    
-    def log_stage(self, stage_name):
-        """Log a stage in the computation"""
-        self.stages.append({
-            'name': stage_name,
-            'time': time.time(),
-            'memory_usage': psutil.Process().memory_info().rss / 1024 / 1024  # MB
-        })
-    
-    def log_error(self, error):
-        """Log an error"""
-        self.errors.append({
-            'time': time.time(),
-            'error': str(error),
-            'type': type(error).__name__
-        })
-    
-    def generate_error_report(self):
-        """Generate a comprehensive error report"""
-        report = ["Error Report", "=" * 50]
+    def _calculate_circuit_fidelity(self, circuit_state, ideal_state=None):
+        """Fixed fidelity calculation"""
+        if circuit_state is None or np.all(circuit_state == 0):
+            return 0.0
         
-        if self.errors:
-            for i, error in enumerate(self.errors, 1):
-                report.append(f"\nError {i}:")
-                report.append(f"Type: {error['type']}")
-                report.append(f"Message: {error['error']}")
-                report.append(f"Time: {error['time'] - self.start_time:.2f}s after start")
-        
-        if self.stages:
-            report.append("\nStage Timeline:")
-            for stage in self.stages:
-                report.append(f"- {stage['name']}: {stage['time'] - self.start_time:.2f}s")
-                report.append(f"  Memory Usage: {stage['memory_usage']:.1f} MB")
-        
-        return "\n".join(report)
-
-class PerformanceMonitor:
-    def __init__(self):
-        self.metrics = {
-            'singular_value_error': [],
-            'circuit_fidelity': [],
-            'noise_impact': [],
-            'optimization_progress': []
+        # Proper normalization
+        circuit_state = circuit_state / np.linalg.norm(circuit_state)
+        if ideal_state is not None:
+            ideal_state = ideal_state / np.linalg.norm(ideal_state)
+            return np.abs(np.vdot(circuit_state, ideal_state))**2
+        return 1.0  # If no ideal state, perfect fidelity
+    
+    def optimize_circuit_depth(self):
+        """Dynamically adjust circuit depth based on noise levels"""
+        current_fidelity = self.get_current_fidelity()
+        if current_fidelity < self.target_fidelity:
+            self.reduce_depth()
+        return self.current_depth
+    
+    def schedule_gates(self):
+        """Implement noise-aware gate scheduling"""
+        # Prioritize gates based on error rates
+        gate_errors = {
+            'single': self.noise_params['gate_times']['single'],
+            'two': self.noise_params['gate_times']['two']
         }
+        # Schedule gates with lower error rates first
+        sorted_gates_by_error = sorted(gate_errors, key=lambda x: gate_errors[x])
+        return sorted_gates_by_error
     
-    def update(self, current_values, true_values, circuit_state, noise_level):
-        error = np.mean(np.abs(current_values - true_values))
-        self.metrics['singular_value_error'].append(error)
+    def train(self, num_epochs=1000):
+        """Simplified training loop"""
+        best_params = None
+        best_fidelity = -float('inf')
         
-        fidelity = self._calculate_circuit_fidelity(circuit_state)
-        self.metrics['circuit_fidelity'].append(fidelity)
-        
-        self.metrics['noise_impact'].append(noise_level)
-    
-    def _calculate_circuit_fidelity(self, circuit_state):
-        """
-        Calculate quantum state fidelity from circuit state
-        
-        Parameters:
-        -----------
-        circuit_state : numpy.ndarray
-            The quantum state vector or density matrix
-        
-        Returns:
-        --------
-        float
-            Fidelity metric between 0 and 1
-        """
-        try:
-            # If circuit_state is a state vector
-            if isinstance(circuit_state, np.ndarray) and circuit_state.ndim == 1:
-                # Calculate state purity
-                return np.abs(np.vdot(circuit_state, circuit_state))
+        for epoch in range(num_epochs):
+            # Forward pass
+            current_fidelity = self._evaluate_circuit(self.circuit)
             
-            # If circuit_state is a density matrix
-            elif isinstance(circuit_state, np.ndarray) and circuit_state.ndim == 2:
-                # Calculate trace fidelity
-                return np.real(np.trace(circuit_state @ circuit_state.conj().T))
+            # Compute gradients
+            grads = self._compute_parameter_gradients(self.circuit, self.parameters)
             
-            # If circuit_state is a list of measurement outcomes
-            elif isinstance(circuit_state, (list, np.ndarray)):
-                # Calculate classical fidelity based on measurement statistics
-                return 1.0 - np.mean(np.abs(circuit_state))
+            # Basic gradient descent
+            self.parameters += self.learning_rate * grads
             
-            else:
-                print(f"Warning: Unexpected circuit state type: {type(circuit_state)}")
-                return 0.5
+            # Track best result
+            if current_fidelity > best_fidelity:
+                best_fidelity = current_fidelity
+                best_params = self.parameters.copy()
                 
-        except Exception as e:
-            print(f"Warning: Error calculating circuit fidelity: {str(e)}")
-            return 0.5
-    
-    def generate_report(self):
-        """Generate a report of the current metrics"""
-        # Check if we have enough data points
-        if len(self.metrics['circuit_fidelity']) < 2:
-            return {
-                'avg_error': np.mean(self.metrics['singular_value_error']) if self.metrics['singular_value_error'] else 0.0,
-                'fidelity_trend': 0.0,  # Not enough data for gradient
-                'noise_correlation': 0.0  # Not enough data for correlation
-            }
-            
-        return {
-            'avg_error': np.mean(self.metrics['singular_value_error']),
-            'fidelity_trend': self._calculate_trend(self.metrics['circuit_fidelity']),
-            'noise_correlation': self._calculate_correlation()
-        }
-    
-    def _calculate_trend(self, data):
-        """Calculate trend with safety checks"""
-        if len(data) < 2:
-            return 0.0
-        try:
-            # Calculate simple difference for trend
-            # Positive value means improving, negative means degrading
-            recent_data = data[-10:]  # Look at recent history
-            return np.mean(np.diff(recent_data))
-        except Exception as e:
-            print(f"Warning: Error calculating trend: {str(e)}")
-            return 0.0
-    
-    def _calculate_correlation(self):
-        """Calculate correlation with safety checks"""
-        try:
-            if len(self.metrics['noise_impact']) < 2:
-                return 0.0
-            return np.corrcoef(
-                self.metrics['noise_impact'], 
-                self.metrics['singular_value_error']
-            )[0,1]
-        except Exception as e:
-            print(f"Warning: Error calculating correlation: {str(e)}")
-            return 0.0
+            if epoch % 100 == 0:
+                print(f"Epoch {epoch}: Fidelity = {current_fidelity:.4f}")
+        
+        self.parameters = best_params
+
+__all__ = [
+    'SimulatedQSVD',
+    'PerformanceMonitor'
+]

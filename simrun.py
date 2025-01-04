@@ -1,6 +1,6 @@
 import numpy as np
-from simqrl import SimulatedQuantumEnv, train_agent, plot_training_metrics, CoherentError
-from simqsvd import SimulatedQSVD, PerformanceMonitor
+from QSVD.simqrl import SimulatedQuantumEnv, train_agent, plot_training_metrics, CoherentError
+from QSVD.simqsvd import SimulatedQSVD, PerformanceMonitor
 import logging
 from logging_config import setup_logging
 from ppo_agent import PPOAgent

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from scipy.linalg import svd as classical_svd
-from simqsvd import SimulatedQSVD, PerformanceMonitor
+from QSVD.simqsvd import SimulatedQSVD, PerformanceMonitor
 from running_mean_std import RunningMeanStd
 from qiskit import QuantumCircuit
 from qiskit.circuit import Parameter

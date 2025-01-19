@@ -13,10 +13,10 @@ from qiskit_aer import AerSimulator
 from qiskit.quantum_info import partial_trace
 from functools import partial
 import random
+from logging_config import setup_logging
 from collections import deque
 from torch.distributions import Normal
 import logging
-from logging_config import setup_logging
 from qiskit_aer import Aer
 from qiskit_aer.noise import NoiseModel, thermal_relaxation_error, ReadoutError
 from qiskit.quantum_info import state_fidelity

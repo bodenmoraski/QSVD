@@ -35,125 +35,90 @@ class QSVDNoiseEnv(gym.Env):
         super(QSVDNoiseEnv, self).__init__()
         n = M.shape[0]
         self.M = M
-        self.rank = rank
+        self.rank = min(M.shape)  # Use full rank instead of truncated rank
         self.circuit_depth = circuit_depth
         
-        # Calculate total dimensions
-        self.u_dim = n * rank  # 8 * 3 = 24 for U matrix
-        self.d_dim = rank      # 3 for diagonal values
-        self.v_dim = n * rank  # 8 * 3 = 24 for V matrix
-        total_dim = self.u_dim + self.d_dim + self.v_dim  # 24 + 3 + 24 = 51
+        # Calculate dimensions
+        self.n = n
+        self.action_dim = n * self.rank * 2 + self.rank  # U(n×rank) + V(n×rank) + D(rank)
+        self.obs_dim = n * self.rank * 2 + self.rank + 1  # U(n×rank) + V(n×rank) + D(rank) + error
         
-        # Action and observation spaces with explicit dimensions
+        # Define action and observation spaces
         self.action_space = spaces.Box(
             low=-1,
             high=1,
-            shape=(total_dim,),
+            shape=(self.action_dim,),
             dtype=np.float32
         )
+        
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(total_dim + 1,),  # +1 for initial error
+            shape=(self.obs_dim,),
             dtype=np.float32
         )
-
+        
+        # Print dimensions for debugging
+        print(f"Environment dimensions:")
+        print(f"Matrix size (n): {n}")
+        print(f"Full rank: {self.rank}")
+        print(f"Action space dim: {self.action_dim}")
+        print(f"Observation space dim: {self.obs_dim}")
+        
+        # Compute reference singular values
+        self.true_s = self._compute_reference_singular_values(M, self.rank)
+        
         # Initial state
         self.reset()
+
+    def _compute_reference_singular_values(self, matrix, num_values, num_iterations=100):
+        """Compute approximate singular values using power method"""
+        m, n = matrix.shape
+        singular_values = np.zeros(num_values)
+        A = matrix.copy()
+        
+        for i in range(num_values):
+            # Initialize random vector
+            v = np.random.randn(n)
+            v = v / np.linalg.norm(v)
+            
+            # Power iteration
+            for _ in range(num_iterations * (i + 1)):  # More iterations for smaller values
+                # Compute left singular vector
+                u = A @ v
+                sigma = np.linalg.norm(u)
+                if sigma > 1e-10:
+                    u = u / sigma
+                
+                # Compute right singular vector
+                v = A.T @ u
+                sigma = np.linalg.norm(v)
+                if sigma > 1e-10:
+                    v = v / sigma
+            
+            # Store singular value
+            singular_values[i] = sigma
+            
+            # Deflate matrix
+            A = A - sigma * np.outer(u, v)
+        
+        return singular_values
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         
-        # Get initial noisy decomposition
+        # Get initial noisy decomposition using full rank
         self.U_noisy, self.D_noisy, self.V_noisy, _ = simulate_vqsvd_with_noise(
             self.M, 
-            self.rank, 
+            self.rank,  # Now using full rank
             circuit_depth=self.circuit_depth
         )
         
-        # Calculate and store initial error
-        D_diag = np.diag(self.D_noisy)
-        M_reconstructed = self.U_noisy @ D_diag @ self.V_noisy.T
+        # Calculate initial error
+        M_reconstructed = self.U_noisy @ np.diag(self.D_noisy) @ self.V_noisy.T
         self.initial_frobenius_error = np.linalg.norm(self.M - M_reconstructed, ord='fro') / np.linalg.norm(self.M, ord='fro')
         
-        # Enhanced state: Include current error and initial error
-        observation = np.concatenate([
-            self.U_noisy.flatten(),
-            self.D_noisy,
-            self.V_noisy.flatten(),
-            [self.initial_frobenius_error]  # Add initial error level
-        ])
-        
-        return observation, {}
-
-    def step(self, action):
-        n, r = self.M.shape[0], self.rank
-        
-        # Debug action shape
-        action = np.array(action, dtype=np.float32)
-        if len(action.shape) == 0:
-            action = np.array([action])  # Handle scalar case
-        action = action.flatten()
-        
-        # Verify action dimensions
-        expected_dim = self.u_dim + self.d_dim + self.v_dim
-        if action.size != expected_dim:
-            raise ValueError(f"Action size {action.size} does not match expected size {expected_dim}")
-        
-        # Scale down actions for more stable learning
-        action = action * 0.1
-        
-        # Calculate indices for slicing
-        u_end = self.u_dim
-        d_end = u_end + self.d_dim
-        v_end = d_end + self.v_dim
-        
-        # Safely reshape with dimension checks
-        try:
-            U_adjust = action[:u_end].reshape(n, r)
-            D_adjust = action[u_end:d_end]
-            V_adjust = action[d_end:v_end].reshape(n, r)
-        except ValueError as e:
-            print(f"Action shape error: action size = {action.size}, u_end = {u_end}, d_end = {d_end}, v_end = {v_end}")
-            print(f"Trying to reshape to: U({n}, {r}), D({self.d_dim},), V({n}, {r})")
-            raise e
-
-        self.U_noisy += U_adjust
-        self.D_noisy += D_adjust
-        self.V_noisy += V_adjust
-
-        # Ensure orthonormality after adjustment
-        self.U_noisy, _ = np.linalg.qr(self.U_noisy)
-        self.V_noisy, _ = np.linalg.qr(self.V_noisy)
-
-        # Reconstruct the matrix using rank x rank diagonal matrix
-        D_diag = np.diag(self.D_noisy)  # Creates r x r diagonal matrix
-        M_reconstructed = self.U_noisy @ D_diag @ self.V_noisy.T
-
-        # Calculate all error metrics
-        frobenius_error = np.linalg.norm(self.M - M_reconstructed, ord='fro') / np.linalg.norm(self.M, ord='fro')
-        
-        # Calculate orthonormality error
-        orthonormality_error = (
-            np.linalg.norm(self.U_noisy.T @ self.U_noisy - np.eye(r), ord='fro') +
-            np.linalg.norm(self.V_noisy.T @ self.V_noisy - np.eye(r), ord='fro')
-        )
-        
-        # Quick spectral properties (O(n) operations)
-        M_diag = np.diag(self.M)  # Main diagonal elements
-        R_diag = np.diag(M_reconstructed)
-        
-        # Compare diagonal dominance
-        diag_similarity = 1 - np.linalg.norm(M_diag - R_diag) / np.linalg.norm(M_diag)
-        
-        # Combine all components into final reward
-        reward = (
-            2.0 * diag_similarity     # Diagonal similarity
-            - frobenius_error         # Reconstruction error
-            - 0.01 * orthonormality_error  # Keep matrices well-formed
-        )
-
-        # Next state
+        # Create observation
         observation = np.concatenate([
             self.U_noisy.flatten(),
             self.D_noisy,
@@ -161,15 +126,66 @@ class QSVDNoiseEnv(gym.Env):
             [self.initial_frobenius_error]
         ])
         
-        terminated = False
-        truncated = False
+        print(f"Reset - Shapes:")
+        print(f"U_noisy: {self.U_noisy.shape}")
+        print(f"D_noisy: {self.D_noisy.shape}")
+        print(f"V_noisy: {self.V_noisy.shape}")
+        print(f"Observation: {observation.shape}")
+        
+        return observation, {}
+
+    def step(self, action):
+        # Reshape action to match matrices
+        action = np.array(action, dtype=np.float32).flatten()
+        
+        # Split action into U, D, and V adjustments
+        u_end = self.n * self.rank
+        d_end = u_end + self.rank
+        
+        U_adjust = action[:u_end].reshape(self.n, self.rank)
+        D_adjust = action[u_end:d_end]
+        V_adjust = action[d_end:].reshape(self.n, self.rank)
+        
+        # Apply adjustments
+        self.U_noisy += U_adjust
+        self.D_noisy += D_adjust
+        self.V_noisy += V_adjust
+        
+        # Ensure orthonormality
+        self.U_noisy, _ = np.linalg.qr(self.U_noisy)
+        self.V_noisy, _ = np.linalg.qr(self.V_noisy)
+        
+        # Reconstruct matrix
+        M_reconstructed = self.U_noisy @ np.diag(self.D_noisy) @ self.V_noisy.T
+        
+        # Calculate error and reward
+        frobenius_error = np.linalg.norm(self.M - M_reconstructed, ord='fro') / np.linalg.norm(self.M, ord='fro')
+        reward = -frobenius_error
+        
+        # Calculate diagonal similarity using pre-computed reference values
+        diag_similarity = 1.0 - np.mean(np.abs(self.true_s - self.D_noisy) / (self.true_s + 1e-8))
+        
+        # Orthonormality error
+        u_ortho_error = np.mean(np.abs(self.U_noisy.T @ self.U_noisy - np.eye(self.rank)))
+        v_ortho_error = np.mean(np.abs(self.V_noisy.T @ self.V_noisy - np.eye(self.rank)))
+        orthonormality_error = (u_ortho_error + v_ortho_error) / 2
+        
+        # Create observation
+        observation = np.concatenate([
+            self.U_noisy.flatten(),
+            self.D_noisy,
+            self.V_noisy.flatten(),
+            [self.initial_frobenius_error]
+        ])
+        
+        done = False
         info = {
             'frobenius_error': frobenius_error,
             'diag_similarity': diag_similarity,
             'orthonormality_error': orthonormality_error
         }
         
-        return observation, reward, terminated, truncated, info
+        return observation, reward, done, False, info
 
     def compute_reward(self, M_reconstructed):
         # Add immediate rewards for small improvements
@@ -359,13 +375,13 @@ if __name__ == "__main__":
     rank = 3
     
     env = make_vec_env(
-        lambda: QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=rank),
+        lambda: QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=matrix_size),
         n_envs=4
     )
     env = VecNormalize(env, norm_obs=True, norm_reward=True)
 
     # Verify environment dimensions
-    test_env = QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=rank)
+    test_env = QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=matrix_size)
     print(f"Action space shape: {test_env.action_space.shape}")
     print(f"Observation space shape: {test_env.observation_space.shape}")
 

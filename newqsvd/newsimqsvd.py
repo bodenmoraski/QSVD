@@ -9,29 +9,111 @@ from qiskit.circuit.library import IGate, XGate, YGate, ZGate
 
 
 def simulate_vqsvd_with_noise(M, rank, circuit_depth=20):
+    """
+    Simulate quantum-inspired SVD with noise
+    
+    Parameters:
+    -----------
+    M : ndarray
+        Input matrix of shape (n, n)
+    rank : int
+        Desired rank of approximation (used for noise model)
+    circuit_depth : int
+        Depth of simulated quantum circuit (affects noise level)
+    """
     n = M.shape[0]
+    full_rank = min(M.shape)  # Use full rank for computation
     
-    # Generate singular values with noise
-    true_singular_values = np.sort(np.random.rand(rank))[::-1]
-    singular_value_noise = np.random.normal(0, 0.1, size=rank)  # 10% noise
-    approx_singular_values = true_singular_values * (1 + singular_value_noise)
+    def power_method(matrix, num_iterations=100):
+        m, n = matrix.shape
+        U = np.zeros((m, full_rank))
+        s = np.zeros(full_rank)
+        V = np.zeros((n, full_rank))
+        
+        A = matrix.copy()
+        for r in range(full_rank):
+            # Initialize random vector
+            v = np.random.randn(n)
+            v = v / np.linalg.norm(v)
+            
+            # Power iteration with increased iterations for smaller singular values
+            num_iter = num_iterations * (1 + r)  # More iterations for smaller values
+            for _ in range(num_iter):
+                # Compute left singular vector
+                u = A @ v
+                sigma = np.linalg.norm(u)
+                if sigma > 1e-10:
+                    u = u / sigma
+                
+                # Compute right singular vector
+                v = A.T @ u
+                sigma = np.linalg.norm(v)
+                if sigma > 1e-10:
+                    v = v / sigma
+            
+            # Store the computed vectors and value
+            U[:, r] = u
+            s[r] = sigma
+            V[:, r] = v
+            
+            # Deflate the matrix with increased numerical stability
+            A = A - sigma * np.outer(u, v)
+            # Reorthogonalize against previous vectors
+            if r > 0:
+                U[:, r] = U[:, r] - U[:, :r] @ (U[:, :r].T @ U[:, r])
+                V[:, r] = V[:, r] - V[:, :r] @ (V[:, :r].T @ V[:, r])
+                U[:, r] = U[:, r] / np.linalg.norm(U[:, r])
+                V[:, r] = V[:, r] / np.linalg.norm(V[:, r])
+        
+        return U, s, V
     
-    # Generate singular vectors with noise
-    U = np.linalg.qr(np.random.randn(n, rank))[0]
-    V = np.linalg.qr(np.random.randn(n, rank))[0]
+    # Compute approximate SVD using power method
+    U_true, s_true, V_true = power_method(M)
+    
+    # Generate noise that decreases for smaller singular values
+    noise_scale = np.exp(-np.arange(full_rank) / rank)  # Exponentially decreasing noise
+    singular_value_noise = np.random.normal(0, 0.1 * noise_scale)
+    approx_singular_values = s_true * (1 + singular_value_noise)
+    
+    # Add noise to singular vectors with decreasing magnitude
     noise_level = 1 / circuit_depth
-    U_noisy = U + noise_level * np.random.randn(*U.shape)
-    V_noisy = V + noise_level * np.random.randn(*V.shape)
+    U_noise = np.random.randn(*U_true.shape) * noise_level * noise_scale[None, :]
+    V_noise = np.random.randn(*V_true.shape) * noise_level * noise_scale[None, :]
     
-    # Ensure orthonormality
-    U_noisy, _ = np.linalg.qr(U_noisy)
-    V_noisy, _ = np.linalg.qr(V_noisy)
+    U_noisy = U_true + U_noise
+    V_noisy = V_true + V_noise
     
-    # Construct reconstructed matrix using rank x rank diagonal matrix
-    D = np.diag(approx_singular_values)  # This creates a rank x rank diagonal matrix
+    # Ensure orthonormality through modified Gram-Schmidt process
+    def gram_schmidt(matrix):
+        Q = np.zeros_like(matrix)
+        for i in range(matrix.shape[1]):
+            q = matrix[:, i]
+            # Double Gram-Schmidt for better numerical stability
+            for _ in range(2):
+                for j in range(i):
+                    q = q - np.dot(Q[:, j], q) * Q[:, j]
+            norm = np.linalg.norm(q)
+            if norm > 1e-10:
+                q = q / norm
+            Q[:, i] = q
+        return Q
+    
+    U_noisy = gram_schmidt(U_noisy)
+    V_noisy = gram_schmidt(V_noisy)
+    
+    # Create diagonal matrix of correct shape
+    D = np.zeros((full_rank, full_rank))
+    np.fill_diagonal(D, approx_singular_values)
+    
+    # Reconstruct matrix
     M_reconstructed = U_noisy @ D @ V_noisy.T
     
     # Compute error
     frobenius_error = np.linalg.norm(M - M_reconstructed, ord='fro') / np.linalg.norm(M, ord='fro')
+    
+    # Print shapes for debugging
+    print(f"Shapes - U_noisy: {U_noisy.shape}, D: {D.shape}, V_noisy: {V_noisy.shape}")
+    print(f"Original matrix shape: {M.shape}")
+    print(f"Reconstructed matrix shape: {M_reconstructed.shape}")
     
     return U_noisy, approx_singular_values, V_noisy, frobenius_error

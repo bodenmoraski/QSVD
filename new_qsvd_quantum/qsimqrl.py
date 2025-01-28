@@ -4,7 +4,7 @@ from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecNormalize
-from newsimqsvd import simulate_vqsvd_with_noise
+from qsimqsvd import simulate_vqsvd_with_noise
 import logging
 import sys
 from datetime import datetime
@@ -12,6 +12,12 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import deque
 import pandas as pd
+from qiskit import QuantumCircuit
+from qiskit_aer import AerSimulator
+from qiskit_aer.noise import NoiseModel
+from qiskit_aer.noise import depolarizing_error, thermal_relaxation_error
+from qiskit.circuit import Parameter
+from qiskit import QuantumRegister, ClassicalRegister
 
 # Set up logging configuration at the top of the file
 def setup_logging():
@@ -33,37 +39,34 @@ def setup_logging():
 class QSVDNoiseEnv(gym.Env):
     def __init__(self, M, rank, circuit_depth=20):
         super(QSVDNoiseEnv, self).__init__()
-        n = M.shape[0]
         self.M = M
-        self.rank = min(M.shape)  # Use full rank instead of truncated rank
+        self.rank = rank
         self.circuit_depth = circuit_depth
+        self.n = M.shape[0]
+        self.n_qubits = int(np.ceil(np.log2(self.n)))  # Number of qubits needed
         
-        # Calculate dimensions
-        self.n = n
-        self.action_dim = n * self.rank * 2 + self.rank  # U(n×rank) + V(n×rank) + D(rank)
-        self.obs_dim = n * self.rank * 2 + self.rank + 1  # U(n×rank) + V(n×rank) + D(rank) + error
+        # Initialize quantum backend
+        self.backend = AerSimulator()
         
         # Define action and observation spaces
         self.action_space = spaces.Box(
-            low=-1,
-            high=1,
-            shape=(self.action_dim,),
+            low=-1, high=1, 
+            shape=(self.n * self.rank * 2 + self.rank,), 
             dtype=np.float32
         )
         
         self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(self.obs_dim,),
+            low=-np.inf, high=np.inf,
+            shape=(self.n * self.rank * 2 + self.rank + 1,),
             dtype=np.float32
         )
         
         # Print dimensions for debugging
         print(f"Environment dimensions:")
-        print(f"Matrix size (n): {n}")
+        print(f"Matrix size (n): {self.n}")
         print(f"Full rank: {self.rank}")
-        print(f"Action space dim: {self.action_dim}")
-        print(f"Observation space dim: {self.obs_dim}")
+        print(f"Action space dim: {self.action_space.shape}")
+        print(f"Observation space dim: {self.observation_space.shape}")
         
         # Compute reference singular values
         self.true_s = self._compute_reference_singular_values(M, self.rank)
@@ -104,26 +107,58 @@ class QSVDNoiseEnv(gym.Env):
         
         return singular_values
 
+    def _quantum_deflation(self, matrix, singular_value, left_vector, right_vector):
+        """Basic quantum deflation process
+        
+        Args:
+            matrix: Current matrix
+            singular_value: Found singular value
+            left_vector: Left singular vector
+            right_vector: Right singular vector
+            
+        Returns:
+            ndarray: Deflated matrix
+        """
+        # Create deflation circuit
+        q_reg = QuantumRegister(self.n_qubits * 2, 'q')  # Double qubits for left and right vectors
+        c_reg = ClassicalRegister(self.n_qubits * 2, 'c')  # Classical register for measurements
+        circuit = QuantumCircuit(q_reg, c_reg)
+        
+        # Encode vectors
+        self._encode_vector(circuit, left_vector, range(self.n_qubits))
+        self._encode_vector(circuit, right_vector, range(self.n_qubits, 2*self.n_qubits))
+        
+        # Apply controlled operations for deflation
+        for i in range(self.n_qubits):
+            circuit.cx(q_reg[i], q_reg[i + self.n_qubits])
+        
+        # Add measurements for all qubits
+        circuit.measure(q_reg, c_reg)
+        
+        # Execute circuit with error mitigation
+        backend = AerSimulator()
+        job = backend.run(circuit, shots=1000)
+        result = job.result()
+        counts = result.get_counts()
+        
+        # Process measurement results
+        measured_state = self._counts_to_vector(counts)
+        deflated = matrix - singular_value * np.outer(left_vector, right_vector)
+        return deflated
+
     def reset(self, seed=None, options=None):
+        """Reset environment with quantum initialization"""
         super().reset(seed=seed)
         
-        # Get initial noisy decomposition using full rank
-        self.U_noisy, self.D_noisy, self.V_noisy, _ = simulate_vqsvd_with_noise(
-            self.M, 
-            self.rank,  # Now using full rank
-            circuit_depth=self.circuit_depth
-        )
-        
-        # Calculate initial error
-        M_reconstructed = self.U_noisy @ np.diag(self.D_noisy) @ self.V_noisy.T
-        self.initial_frobenius_error = np.linalg.norm(self.M - M_reconstructed, ord='fro') / np.linalg.norm(self.M, ord='fro')
+        # Initialize quantum state
+        self.U_noisy, self.D_noisy, self.V_noisy, _ = self.quantum_power_iteration(self.M)
         
         # Create observation
         observation = np.concatenate([
             self.U_noisy.flatten(),
             self.D_noisy,
             self.V_noisy.flatten(),
-            [self.initial_frobenius_error]
+            [0.0]  # Initial error
         ])
         
         print(f"Reset - Shapes:")
@@ -175,7 +210,7 @@ class QSVDNoiseEnv(gym.Env):
             self.U_noisy.flatten(),
             self.D_noisy,
             self.V_noisy.flatten(),
-            [self.initial_frobenius_error]
+            [frobenius_error]
         ])
         
         done = False
@@ -201,6 +236,331 @@ class QSVDNoiseEnv(gym.Env):
         action_penalty = -0.1 * np.mean(np.abs(action))  # New penalty
         
         return improvement_reward + action_penalty
+
+    def quantum_power_iteration(self, matrix, num_iterations=100):
+        """Quantum version of power iteration"""
+        m, n = matrix.shape
+        U = np.zeros((m, self.rank))
+        s = np.zeros(self.rank)
+        V = np.zeros((n, self.rank))
+        
+        A = matrix.copy()
+        for r in range(self.rank):
+            # Initialize random vector
+            v = np.random.randn(n)
+            v = v / np.linalg.norm(v)
+            
+            for _ in range(num_iterations):
+                # Create and execute quantum circuits
+                circuit_u = self.create_quantum_matrix_circuit(v)
+                u = self._execute_quantum_circuit(circuit_u)
+                sigma = np.linalg.norm(u)
+                if sigma > 1e-10:
+                    u = u / sigma
+                
+                circuit_v = self.create_quantum_matrix_circuit(u)
+                v = self._execute_quantum_circuit(circuit_v)
+                sigma = np.linalg.norm(v)
+                if sigma > 1e-10:
+                    v = v / sigma
+            
+            U[:, r] = u
+            s[r] = sigma
+            V[:, r] = v
+            
+            # Quantum deflation
+            A = self._quantum_deflation(A, sigma, u, v)
+        
+        return U, s, V, np.linalg.norm(matrix - U @ np.diag(s) @ V.T)
+
+    def create_quantum_matrix_circuit(self, input_vector):
+        """Create quantum circuit for matrix-vector multiplication
+        
+        Args:
+            input_vector (ndarray): Input vector for multiplication
+            
+        Returns:
+            QuantumCircuit: Circuit implementing matrix multiplication
+        """
+        # Create circuit with quantum and classical registers
+        q_reg = QuantumRegister(self.n_qubits * 2, 'q')
+        c_reg = ClassicalRegister(self.n_qubits * 2, 'c')  # Measure all qubits
+        circuit = QuantumCircuit(q_reg, c_reg)
+        
+        # Encode input vector
+        self._encode_vector(circuit, input_vector, range(self.n_qubits))
+        
+        # Store parameters for later binding
+        self.circuit_parameters = []
+        
+        # Add quantum operations for matrix multiplication
+        for i in range(self.n_qubits):
+            # Add controlled operations between input and output registers
+            circuit.cx(q_reg[i], q_reg[i + self.n_qubits])
+            
+            # Add parameterized rotations
+            theta = Parameter(f'θ_{i}')
+            self.circuit_parameters.append(theta)
+            circuit.ry(theta, q_reg[i + self.n_qubits])
+            
+            # Add phase operations
+            phi = Parameter(f'φ_{i}')
+            self.circuit_parameters.append(phi)
+            circuit.rz(phi, q_reg[i + self.n_qubits])
+        
+        # Add measurements for all qubits
+        circuit.measure(q_reg, c_reg)
+        
+        # Add barrier before measurements to prevent optimization across measurement
+        circuit.barrier()
+        
+        return circuit
+
+    def _execute_quantum_circuit(self, circuit, shots=1000):
+        """Execute quantum circuit with parameter binding and error mitigation
+        
+        Args:
+            circuit (QuantumCircuit): Circuit to execute
+            shots (int): Number of shots for execution
+            
+        Returns:
+            ndarray: Resulting quantum state vector
+        """
+        # Configure backend
+        backend = AerSimulator()
+        
+        # Bind parameters if they exist
+        if hasattr(self, 'circuit_parameters') and circuit.parameters:
+            # Generate random parameter values (you might want to make this more sophisticated)
+            param_values = np.random.uniform(-np.pi, np.pi, len(self.circuit_parameters))
+            param_dict = dict(zip(self.circuit_parameters, param_values))
+            circuit = circuit.assign_parameters(param_dict)
+        
+        # Add barrier before measurements if not already present
+        if not (circuit.data and circuit.data[-1].operation.name == 'barrier'):
+            circuit.barrier()
+        
+        # Multiple circuit executions for error mitigation
+        results = []
+        for _ in range(3):  # Multiple runs for better accuracy
+            job = backend.run(circuit, shots=shots)
+            result = job.result()
+            counts = result.get_counts()
+            # Convert counts to vector
+            vector = self._counts_to_vector(counts)
+            results.append(vector)
+        
+        # Average results for error mitigation
+        return np.mean(results, axis=0)
+
+    def _counts_to_vector(self, counts):
+        """Convert quantum measurement counts to vector"""
+        vector = np.zeros(2**self.n_qubits)
+        total_shots = sum(counts.values())
+        
+        for bitstring, count in counts.items():
+            # Ensure bitstring is the correct length
+            bitstring = bitstring.zfill(2 * self.n_qubits)  # Double the qubits as we're measuring both registers
+            # Take only the relevant part of the bitstring for the output register
+            output_bitstring = bitstring[self.n_qubits:]
+            index = int(output_bitstring, 2)
+            vector[index] = np.sqrt(count / total_shots)
+        
+        return vector
+
+    def compute_quantum_reward(self, quantum_state, action):
+        """Compute reward based on quantum measurements only"""
+        # Quantum fidelity measurement
+        fidelity = self._measure_quantum_fidelity(quantum_state)
+        
+        # Circuit complexity penalty
+        depth_penalty = -0.1 * self._count_quantum_operations(action)
+        
+        # Quantum state purity measure
+        purity = self._measure_state_purity(quantum_state)
+        
+        # Combined quantum-native reward
+        reward = (0.5 * fidelity + 
+                 0.3 * purity + 
+                 0.2 * depth_penalty)
+        
+        return reward
+
+    def _measure_quantum_fidelity(self, quantum_state, target_state=None):
+        """Measure fidelity between current and target quantum states using SWAP test
+        
+        Args:
+            quantum_state: Current quantum state
+            target_state: Target quantum state (optional)
+            
+        Returns:
+            float: Estimated fidelity between states
+        """
+        # Create SWAP test circuit
+        n_qubits = self.n_qubits
+        swap_circuit = QuantumCircuit(2 * n_qubits + 1, 1)  # +1 for ancilla
+        
+        # Prepare states
+        swap_circuit.h(0)  # Ancilla in superposition
+        
+        # Encode states
+        self._encode_vector(swap_circuit, quantum_state, range(1, n_qubits + 1))
+        if target_state is not None:
+            self._encode_vector(swap_circuit, target_state, range(n_qubits + 1, 2 * n_qubits + 1))
+        
+        # Apply SWAP test
+        for i in range(n_qubits):
+            swap_circuit.cswap(0, i + 1, i + n_qubits + 1)
+        
+        # Final Hadamard
+        swap_circuit.h(0)
+        swap_circuit.measure(0, 0)
+        
+        # Execute with error mitigation
+        counts = self._execute_with_error_mitigation(swap_circuit)
+        
+        # Calculate fidelity from measurement statistics
+        fidelity = counts.get('0', 0) / sum(counts.values())
+        return 2 * fidelity - 1
+
+    def _execute_with_error_mitigation(self, circuit, shots=1000):
+        """Execute quantum circuit with error mitigation techniques
+        
+        Args:
+            circuit (QuantumCircuit): Circuit to execute
+            shots (int): Number of shots per execution
+            
+        Returns:
+            dict: Mitigated measurement counts
+        """
+        backend = AerSimulator()
+        
+        # Richardson extrapolation for error mitigation
+        scale_factors = [1, 2, 3]  # Scale noise by these factors
+        results = []
+        
+        for scale in scale_factors:
+            # Create noise-scaled circuit
+            scaled_circuit = self._scale_noise(circuit, scale)
+            
+            # Execute circuit
+            job = backend.run(scaled_circuit, shots=shots)
+            counts = job.result().get_counts()
+            results.append(counts)
+        
+        # Apply Richardson extrapolation
+        mitigated_counts = self._richardson_extrapolation(results, scale_factors)
+        return mitigated_counts
+
+    def _scale_noise(self, circuit, scale_factor):
+        """Scale noise in circuit by given factor
+        
+        Args:
+            circuit (QuantumCircuit): Original circuit
+            scale_factor (float): Factor to scale noise by
+            
+        Returns:
+            QuantumCircuit: Circuit with scaled noise
+        """
+        # Create noise model
+        noise_model = NoiseModel()
+        
+        # Add scaled depolarizing error
+        dep_error = depolarizing_error(0.001 * scale_factor, 1)
+        noise_model.add_all_qubit_quantum_error(dep_error, ['u1', 'u2', 'u3'])
+        
+        # Add scaled thermal relaxation
+        t1, t2 = 50, 70  # microseconds
+        thermal_error = thermal_relaxation_error(t1/scale_factor, t2/scale_factor, 0.1)
+        noise_model.add_all_qubit_quantum_error(thermal_error, ['u1', 'u2', 'u3'])
+        
+        # Create noisy circuit
+        noisy_circuit = circuit.copy()
+        noisy_circuit.noise_model = noise_model
+        
+        return noisy_circuit
+
+    def _richardson_extrapolation(self, results, scale_factors):
+        """Apply Richardson extrapolation to measurement results
+        
+        Args:
+            results (list): List of measurement counts at different noise scales
+            scale_factors (list): Corresponding noise scale factors
+            
+        Returns:
+            dict: Extrapolated (mitigated) counts
+        """
+        mitigated_counts = {}
+        
+        # Get all possible bitstrings
+        bitstrings = set().union(*[res.keys() for res in results])
+        
+        for bitstring in bitstrings:
+            # Get probabilities for each scale factor
+            probs = []
+            for counts in results:
+                total = sum(counts.values())
+                prob = counts.get(bitstring, 0) / total
+                probs.append(prob)
+            
+            # Richardson extrapolation formula
+            extrap_prob = 0
+            for i, prob in enumerate(probs):
+                coeff = 1
+                for j, s in enumerate(scale_factors):
+                    if i != j:
+                        coeff *= s / (s - scale_factors[i])
+                extrap_prob += coeff * prob
+            
+            # Convert back to counts
+            if extrap_prob > 0:
+                mitigated_counts[bitstring] = int(extrap_prob * 1000)  # Scale to reasonable count
+        
+        return mitigated_counts
+
+    def _measure_state_purity(self, quantum_state):
+        """Measure purity of quantum state using multiple SWAP tests
+        
+        Args:
+            quantum_state: Quantum state to measure purity of
+            
+        Returns:
+            float: Estimated purity of state
+        """
+        # Create circuit for purity measurement
+        purity_circuit = QuantumCircuit(2 * self.n_qubits + 1, 1)
+        
+        # Prepare two copies of the state
+        self._encode_vector(purity_circuit, quantum_state, range(self.n_qubits))
+        self._encode_vector(purity_circuit, quantum_state, range(self.n_qubits, 2 * self.n_qubits))
+        
+        # Apply SWAP test
+        purity = self._measure_quantum_fidelity(quantum_state, quantum_state)
+        
+        return purity
+
+    def _encode_vector(self, circuit, vector, qubits):
+        """Encode a classical vector into quantum state"""
+        # Normalize vector
+        vector = vector / np.linalg.norm(vector)
+        
+        # Convert to quantum state
+        n_qubits = len(qubits)
+        for i in range(len(vector)):
+            if abs(vector[i]) > 1e-10:  # Only apply gates for non-zero amplitudes
+                # Convert index to binary representation
+                bin_i = format(i, f'0{n_qubits}b')
+                # Apply X gates where needed
+                for j, bit in enumerate(bin_i):
+                    if bit == '1':
+                        circuit.x(qubits[j])
+                # Apply rotation
+                if abs(vector[i]) < 1:
+                    circuit.ry(2 * np.arcsin(vector[i]), qubits[0])
+                # Undo X gates
+                for j, bit in enumerate(bin_i):
+                    if bit == '1':
+                        circuit.x(qubits[j])
 
 class MetricsTracker:
     def __init__(self, window_size=100, env=None):

@@ -1,4 +1,9 @@
+import warnings
+warnings.filterwarnings('ignore')
+
 import numpy as np
+np.seterr(all='ignore')
+
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
@@ -39,17 +44,11 @@ def setup_logging():
 class QSVDNoiseEnv(gym.Env):
     def __init__(self, M, rank, circuit_depth=20):
         super(QSVDNoiseEnv, self).__init__()
-        
-        # Add matrix validation and conditioning
-        print("\n=== Initializing QSVDNoiseEnv ===")
-        print(f"Input matrix shape: {M.shape}")
-        
-        # Ensure matrix is well-conditioned
-        self.M = self._condition_matrix(M)
+        self.M = M
         self.rank = rank
         self.circuit_depth = circuit_depth
         self.n = M.shape[0]
-        self.n_qubits = int(np.ceil(np.log2(self.n)))
+        self.n_qubits = int(np.ceil(np.log2(self.n)))  # Number of qubits needed
         
         # Initialize quantum backend
         self.backend = AerSimulator()
@@ -74,120 +73,43 @@ class QSVDNoiseEnv(gym.Env):
         print(f"Action space dim: {self.action_space.shape}")
         print(f"Observation space dim: {self.observation_space.shape}")
         
-        # Compute reference singular values with safety checks
-        self.true_s = self._compute_reference_singular_values(self.M, self.rank)
+        # Compute reference singular values
+        self.true_s = self._compute_reference_singular_values(M, self.rank)
         
         # Initial state
         self.reset()
 
-    def _condition_matrix(self, matrix):
-        """Condition the input matrix to avoid numerical instability"""
-        print("\n=== DEBUG: Entering _condition_matrix ===")
-        print(f"DEBUG: Input matrix shape: {matrix.shape}")
-        print(f"DEBUG: Input matrix type: {type(matrix)}")
-        print("DEBUG: Matrix properties before conditioning:")
-        print(f"DEBUG: - Is matrix None? {matrix is None}")
-        print(f"DEBUG: - Contains NaN? {np.any(np.isnan(matrix))}")
-        print(f"DEBUG: - Contains Inf? {np.any(np.isinf(matrix))}")
-        
-        # Add small regularization term to diagonal
-        print("DEBUG: About to add regularization...")
-        eps = 1e-8
-        n = matrix.shape[0]
-        print(f"DEBUG: Creating identity matrix of size {n}")
-        eye_matrix = np.eye(n)
-        print("DEBUG: Adding regularization term...")
-        regularized = matrix + eps * eye_matrix
-        print("DEBUG: Regularization complete")
-        
-        # Scale matrix to have reasonable norm
-        print("DEBUG: About to compute Frobenius norm...")
-        try:
-            norm = np.linalg.norm(regularized, 'fro')
-            print(f"DEBUG: Frobenius norm computed: {norm:.2e}")
-            if norm > 0:
-                print("DEBUG: Scaling matrix...")
-                regularized = regularized / norm
-                print("DEBUG: Matrix scaled successfully")
-        except Exception as e:
-            print(f"DEBUG: Error in norm computation/scaling: {str(e)}")
-        
-        # Check condition number after regularization
-        print("DEBUG: About to compute condition number...")
-        try:
-            cond = np.linalg.cond(regularized)
-            print(f"DEBUG: Matrix condition number after regularization: {cond:.2e}")
-        except Exception as e:
-            print(f"DEBUG: Error computing condition number: {str(e)}")
-        
-        return regularized
-
     def _compute_reference_singular_values(self, matrix, num_values, num_iterations=100):
-        """Compute approximate singular values using power method with enhanced stability"""
-        print("\n=== DEBUG: Entering _compute_reference_singular_values ===")
-        print(f"DEBUG: Matrix shape: {matrix.shape}")
-        print(f"DEBUG: Requested singular values: {num_values}")
-        print("DEBUG: Matrix properties:")
-        print(f"DEBUG: - Contains NaN? {np.any(np.isnan(matrix))}")
-        print(f"DEBUG: - Contains Inf? {np.any(np.isinf(matrix))}")
-        
+        """Compute approximate singular values using power method"""
         m, n = matrix.shape
         singular_values = np.zeros(num_values)
-        print("DEBUG: Creating working copy of matrix...")
         A = matrix.copy()
         
-        # Add small regularization
-        print("DEBUG: Adding initial regularization...")
-        A = A + 1e-8 * np.eye(n)
-        print("DEBUG: Initial regularization complete")
-        
         for i in range(num_values):
-            print(f"\nDEBUG: Computing singular value {i+1}/{num_values}")
             # Initialize random vector
-            print("DEBUG: Initializing random vector...")
             v = np.random.randn(n)
-            print("DEBUG: About to normalize vector...")
-            v = v / (np.linalg.norm(v) + 1e-12)
-            print("DEBUG: Vector normalized")
+            v = v / np.linalg.norm(v)
             
-            # Power iteration with stability checks
-            print(f"DEBUG: Starting power iteration ({num_iterations * (i + 1)} iterations)")
-            for iter in range(num_iterations * (i + 1)):
-                if iter % 100 == 0:  # Print progress every 100 iterations
-                    print(f"DEBUG: Power iteration progress: {iter}/{num_iterations * (i + 1)}")
-                
+            # Power iteration
+            for _ in range(num_iterations * (i + 1)):  # More iterations for smaller values
                 # Compute left singular vector
-                print("DEBUG: Computing left singular vector...") if iter % 100 == 0 else None
                 u = A @ v
                 sigma = np.linalg.norm(u)
-                if sigma > 1e-12:
+                if sigma > 1e-10:
                     u = u / sigma
-                    print(f"DEBUG: Left vector computed, sigma = {sigma:.2e}") if iter % 100 == 0 else None
-                else:
-                    print(f"DEBUG: Warning: Small singular value at index {i}, sigma = {sigma:.2e}")
-                    break
                 
                 # Compute right singular vector
-                print("DEBUG: Computing right singular vector...") if iter % 100 == 0 else None
                 v = A.T @ u
                 sigma = np.linalg.norm(v)
-                if sigma > 1e-12:
+                if sigma > 1e-10:
                     v = v / sigma
-                    print(f"DEBUG: Right vector computed, sigma = {sigma:.2e}") if iter % 100 == 0 else None
-                else:
-                    break
             
             # Store singular value
-            print(f"DEBUG: Storing singular value {i+1}")
-            if sigma > 1e-12:
             singular_values[i] = sigma
-                print(f"DEBUG: Singular value {i+1} = {sigma:.2e}")
-            else:
-                singular_values[i] = 0
-                print(f"DEBUG: Setting singular value {i+1} to 0 due to small sigma")
             
-        print("\nDEBUG: Singular values computation complete")
-        print(f"DEBUG: Range: [{singular_values.min():.2e}, {singular_values.max():.2e}]")
+            # Deflate matrix
+            A = A - sigma * np.outer(u, v)
+        
         return singular_values
 
     def _quantum_deflation(self, matrix, singular_value, left_vector, right_vector):
@@ -231,86 +153,64 @@ class QSVDNoiseEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         """Reset environment with quantum initialization"""
-        print("\n=== DEBUG: Entering reset() ===")
         super().reset(seed=seed)
         
         # Initialize quantum state
-        print("DEBUG: About to call quantum_power_iteration...")
         self.U_noisy, self.D_noisy, self.V_noisy, _ = self.quantum_power_iteration(self.M)
-        print("DEBUG: quantum_power_iteration completed")
-        print(f"DEBUG: U_noisy shape: {self.U_noisy.shape}")
-        print(f"DEBUG: D_noisy shape: {self.D_noisy.shape}")
-        print(f"DEBUG: V_noisy shape: {self.V_noisy.shape}")
         
         # Create observation
-        print("DEBUG: Creating observation vector...")
         observation = np.concatenate([
             self.U_noisy.flatten(),
             self.D_noisy,
             self.V_noisy.flatten(),
             [0.0]  # Initial error
         ])
-        print("DEBUG: Observation vector created")
         
-        print(f"DEBUG: Reset complete - Observation shape: {observation.shape}")
+        print(f"Reset - Shapes:")
+        print(f"U_noisy: {self.U_noisy.shape}")
+        print(f"D_noisy: {self.D_noisy.shape}")
+        print(f"V_noisy: {self.V_noisy.shape}")
+        print(f"Observation: {observation.shape}")
+        
         return observation, {}
 
     def step(self, action):
-        print("\n=== DEBUG: Entering step() ===")
         # Reshape action to match matrices
-        print("DEBUG: Reshaping action...")
         action = np.array(action, dtype=np.float32).flatten()
-        print(f"DEBUG: Action shape after flatten: {action.shape}")
         
         # Split action into U, D, and V adjustments
         u_end = self.n * self.rank
         d_end = u_end + self.rank
-        print("DEBUG: Splitting action into U, D, V adjustments...")
         
         U_adjust = action[:u_end].reshape(self.n, self.rank)
         D_adjust = action[u_end:d_end]
         V_adjust = action[d_end:].reshape(self.n, self.rank)
-        print(f"DEBUG: Adjustment shapes - U: {U_adjust.shape}, D: {D_adjust.shape}, V: {V_adjust.shape}")
         
         # Apply adjustments
-        print("DEBUG: Applying adjustments...")
         self.U_noisy += U_adjust
         self.D_noisy += D_adjust
         self.V_noisy += V_adjust
         
         # Ensure orthonormality
-        print("DEBUG: Performing QR decomposition for orthonormality...")
         self.U_noisy, _ = np.linalg.qr(self.U_noisy)
         self.V_noisy, _ = np.linalg.qr(self.V_noisy)
         
         # Reconstruct matrix
-        print("DEBUG: Reconstructing matrix...")
         M_reconstructed = self.U_noisy @ np.diag(self.D_noisy) @ self.V_noisy.T
-        print(f"DEBUG: Reconstructed matrix shape: {M_reconstructed.shape}")
         
         # Calculate error and reward
-        print("DEBUG: Computing Frobenius error...")
-        try:
         frobenius_error = np.linalg.norm(self.M - M_reconstructed, ord='fro') / np.linalg.norm(self.M, ord='fro')
-            print(f"DEBUG: Frobenius error: {frobenius_error:.2e}")
-        except np.linalg.LinAlgError as e:
-            print(f"DEBUG: Error computing Frobenius norm: {e}")
-            frobenius_error = float('inf')
-        
         reward = -frobenius_error
         
-        # Calculate diagonal similarity
-        print("DEBUG: Computing diagonal similarity...")
+        # Calculate diagonal similarity using pre-computed reference values
         diag_similarity = 1.0 - np.mean(np.abs(self.true_s - self.D_noisy) / (self.true_s + 1e-8))
         
         # Orthonormality error
-        print("DEBUG: Computing orthonormality error...")
         u_ortho_error = np.mean(np.abs(self.U_noisy.T @ self.U_noisy - np.eye(self.rank)))
         v_ortho_error = np.mean(np.abs(self.V_noisy.T @ self.V_noisy - np.eye(self.rank)))
         orthonormality_error = (u_ortho_error + v_ortho_error) / 2
         
         # Create observation
-        print("DEBUG: Creating observation vector...")
         observation = np.concatenate([
             self.U_noisy.flatten(),
             self.D_noisy,
@@ -325,7 +225,6 @@ class QSVDNoiseEnv(gym.Env):
             'orthonormality_error': orthonormality_error
         }
         
-        print("DEBUG: Step complete")
         return observation, reward, done, False, info
 
     def compute_reward(self, M_reconstructed):
@@ -344,170 +243,168 @@ class QSVDNoiseEnv(gym.Env):
         return improvement_reward + action_penalty
 
     def quantum_power_iteration(self, matrix, num_iterations=100):
-        """Quantum version of power iteration with improved stability and full rank handling"""
-        print("\n=== DEBUG: Entering quantum_power_iteration ===")
-        print(f"DEBUG: Input matrix shape: {matrix.shape}")
-        print("DEBUG: Matrix properties:")
-        print(f"DEBUG: - Contains NaN? {np.any(np.isnan(matrix))}")
-        print(f"DEBUG: - Contains Inf? {np.any(np.isinf(matrix))}")
+        """Quantum version of power iteration with improved stability"""
+        print(f"\n=== Starting quantum power iteration ===")
+        print(f"Matrix shape: {matrix.shape}, Target rank: {self.rank}")
         
         m, n = matrix.shape
         U = np.zeros((m, self.rank))
         s = np.zeros(self.rank)
         V = np.zeros((n, self.rank))
         
-        # Store original matrix and compute its norm for scaling
-        print("DEBUG: Creating working copy of matrix...")
+        # Store original matrix for reorthogonalization
         A = matrix.copy()
-        print("DEBUG: About to compute matrix norm...")
-        matrix_norm = np.linalg.norm(A, 'fro')
-        if matrix_norm > 1e-10:
-            print(f"DEBUG: Scaling matrix by {matrix_norm:.2e}")
-            A = A / matrix_norm
+        A_original = matrix.copy()
         
-        # Initialize parameters
-        print("DEBUG: Initializing parameters...")
-        self.param_values = {}
-        
-        # Use power iteration for initialization instead of randomized SVD
-        print("DEBUG: Starting power iteration initialization...")
-        s_approx = np.zeros(self.rank)
-        v_approx = np.zeros((n, self.rank))
-        
-        for i in range(self.rank):
-            print(f"DEBUG: Initializing singular vector {i+1}/{self.rank}")
-            # Initialize with random vector
-            v = np.random.randn(n)
-            v = v / (np.linalg.norm(v) + 1e-12)
-            
-            # Simple power iteration
-            for _ in range(2):  # Just a few iterations for initialization
-                # Av
-                u = A @ v
-                sigma = np.linalg.norm(u)
-                if sigma > 1e-12:
-                    u = u / sigma
-                
-                # A^T u
-                v = A.T @ u
-                sigma = np.linalg.norm(v)
-                if sigma > 1e-12:
-                    v = v / sigma
-            
-            s_approx[i] = sigma
-            v_approx[:, i] = v
-            
-            # Deflate
-            if sigma > 1e-12:
-                A = A - sigma * np.outer(u, v)
-        
-        print("DEBUG: Initialization complete")
-        print(f"DEBUG: Initial singular values range: [{np.min(s_approx):.2e}, {np.max(s_approx):.2e}]")
+        # Initialize noise parameters with faster decay
+        noise_scale = 0.01
+        noise_decay = 0.8  # Faster decay
+        max_iterations_per_value = min(100, num_iterations)  # Cap maximum iterations
+        print(f"Initial noise scale: {noise_scale}, Max iterations per value: {max_iterations_per_value}")
         
         for r in range(self.rank):
-            # Initialize vectors with stable approach
-            if v_approx is not None and r < len(v_approx):
-                v = v_approx[:, r].copy()
-            else:
+            print(f"\nComputing singular value {r+1}/{self.rank}")
+            # Initialize with improved starting vector
             v = np.random.randn(n)
-            v = v / (np.linalg.norm(v) + 1e-12)
+            v = v / np.linalg.norm(v)
             
-            best_sigma = 0
-            best_u = None
-            best_v = None
+            # Use fixed number of iterations with early stopping
+            current_iterations = max_iterations_per_value
+            print(f"Planning {current_iterations} iterations for this value")
             
-            # Adaptive iterations based on rank
-            current_iterations = num_iterations * (1 + r // 2)
+            prev_sigma = float('inf')
+            convergence_count = 0
+            min_sigma_diff = float('inf')
+            no_improvement_count = 0
             
             for iter in range(current_iterations):
-                # Create quantum circuit with improved stability
+                # Create and execute quantum circuits with noise mitigation
                 circuit_u = self.create_quantum_matrix_circuit(v)
-                
-                # Parameter initialization with stable bounds
-                if r < len(s_approx):
-                    param_scale = min(np.pi/4, np.arcsin(min(1.0, s_approx[r])))
-                    for param in circuit_u.parameters:
-                        if param not in self.param_values:
-                            self.param_values[param] = param_scale * np.random.uniform(0.9, 1.1)
-                
-                # Execute quantum circuit with error mitigation
-                u = self._execute_quantum_circuit(circuit_u, use_saved_params=True)
+                u = self._execute_quantum_circuit(circuit_u)
                 sigma = np.linalg.norm(u)
+                
+                if iter % 10 == 0:  # Print progress periodically
+                    print(f"Iteration {iter}: σ = {sigma:.6f}")
                 
                 if sigma > 1e-10:
                     u = u / sigma
-                    # Stable Gram-Schmidt orthogonalization
+                    
+                    # Reorthogonalize against previous singular vectors
                     if r > 0:
-                        u = self._stable_orthogonalize(u, U[:, :r])
+                        for i in range(r):
+                            u = u - np.dot(U[:, i], u) * U[:, i]
+                        u = u / np.linalg.norm(u)
                 
                 circuit_v = self.create_quantum_matrix_circuit(u)
-                v = self._execute_quantum_circuit(circuit_v, use_saved_params=True)
+                v = self._execute_quantum_circuit(circuit_v)
                 sigma = np.linalg.norm(v)
                 
                 if sigma > 1e-10:
                     v = v / sigma
-                    if r > 0:
-                        v = self._stable_orthogonalize(v, V[:, :r])
-                
-                # Update best vectors if better
-                if sigma > best_sigma:
-                    best_sigma = sigma
-                    best_u = u.copy()
-                    best_v = v.copy()
             
-            # Store results with proper scaling
-            if best_sigma > 1e-10:
-                U[:, r] = best_u
-                s[r] = best_sigma * matrix_norm
-                V[:, r] = best_v
+                    # Reorthogonalize against previous singular vectors
+                    if r > 0:
+                        for i in range(r):
+                            v = v - np.dot(V[:, i], v) * V[:, i]
+                        v = v / np.linalg.norm(v)
                 
-                # Stable deflation
-                deflation_matrix = best_sigma * np.outer(best_u, best_v)
-                A = A - deflation_matrix
+                # Improved convergence check
+                sigma_diff = abs(sigma - prev_sigma)
+                min_sigma_diff = min(min_sigma_diff, sigma_diff)
                 
-                # Periodic reorthogonalization
-                if r > 0 and r % 2 == 0:
-                    U[:, :r+1], V[:, :r+1] = self._stable_reorthogonalize(U[:, :r+1], V[:, :r+1])
-            else:
-                # If singular value is too small, use random initialization
-                U[:, r] = np.random.randn(m)
-                V[:, r] = np.random.randn(n)
-                U[:, r] = U[:, r] / np.linalg.norm(U[:, r])
-                V[:, r] = V[:, r] / np.linalg.norm(V[:, r])
-                s[r] = 0
+                # Check for convergence with more lenient criteria
+                if sigma_diff < 1e-4:  # More lenient threshold
+                    convergence_count += 1
+                    if convergence_count >= 2:  # Fewer consecutive improvements needed
+                        print(f"Converged after {iter+1} iterations (diff: {sigma_diff:.2e})")
+                        break
+                else:
+                    convergence_count = 0
+                
+                # Check for lack of improvement
+                if sigma_diff > min_sigma_diff * 1.1:  # No significant improvement
+                    no_improvement_count += 1
+                else:
+                    no_improvement_count = 0
+                
+                # Early stopping if no improvement
+                if no_improvement_count >= 5:
+                    print(f"Stopping early due to lack of improvement at iteration {iter+1}")
+                    break
+                
+                prev_sigma = sigma
+            
+                # Add controlled noise with faster decay
+                if iter > 0 and iter % 5 == 0:  # More frequent noise application
+                    noise = np.random.randn(*v.shape) * noise_scale
+                    v = v + noise
+                    v = v / np.linalg.norm(v)
+                    noise_scale *= noise_decay
+                    print(f"Applied noise, new scale: {noise_scale:.2e}")
+            
+            # Store converged vectors and value
+            U[:, r] = u
+            s[r] = sigma
+            V[:, r] = v
+            print(f"Singular value {r+1} = {sigma:.6f}")
         
-        return U, s, V, np.linalg.norm(matrix - U @ np.diag(s) @ V.T)
+            # Quantum deflation with improved stability
+            deflation_matrix = sigma * np.outer(u, v)
+            A = A - deflation_matrix
+            
+            # Periodic reorthogonalization against original matrix
+            if r > 0 and r % 2 == 0:
+                A = A_original.copy()
+                for i in range(r+1):
+                    A = A - s[i] * np.outer(U[:, i], V[:, i])
+                print("Performed periodic reorthogonalization")
+            
+            # Verify orthogonality and fix if necessary
+            if r > 0:
+                U[:, r], V[:, r] = self._ensure_orthogonality(U[:, :r+1], V[:, :r+1], r)
+        
+        error = np.linalg.norm(matrix - U @ np.diag(s) @ V.T)
+        print(f"\nFinal reconstruction error: {error:.6f}")
+        print(f"Final singular values: {s}")
+        return U, s, V, error
 
-    def _stable_orthogonalize(self, vector, basis):
-        """Stable orthogonalization of a vector against a basis"""
-        result = vector.copy()
-        for i in range(basis.shape[1]):
-            # Use stable dot product
-            proj = np.sum(basis[:, i] * result)
-            result = result - proj * basis[:, i]
+    def _ensure_orthogonality(self, U, V, current_index):
+        """Ensure orthogonality of current vectors against previous ones
         
-        # Renormalize with stability check
-        norm = np.linalg.norm(result)
-        if norm > 1e-10:
-            result = result / norm
+        Args:
+            U, V: Current set of singular vectors
+            current_index: Index of current vectors
+            
+        Returns:
+            u, v: Orthogonalized current vectors
+        """
+        u = U[:, current_index].copy()
+        v = V[:, current_index].copy()
+        
+        # Modified Gram-Schmidt for U
+        for i in range(current_index):
+            proj = np.dot(U[:, i], u)
+            u = u - proj * U[:, i]
+        
+        # Modified Gram-Schmidt for V
+        for i in range(current_index):
+            proj = np.dot(V[:, i], v)
+            v = v - proj * V[:, i]
+        
+        # Normalize
+        u_norm = np.linalg.norm(u)
+        v_norm = np.linalg.norm(v)
+        
+        if u_norm > 1e-10 and v_norm > 1e-10:
+            u = u / u_norm
+            v = v / v_norm
         else:
-            result = np.random.randn(len(vector))
-            result = result / np.linalg.norm(result)
+            # If vectors become too small, reinitialize
+            u = np.random.randn(U.shape[0])
+            v = np.random.randn(V.shape[0])
+            u, v = self._ensure_orthogonality(U, V, current_index)  # Recursive call
         
-        return result
-
-    def _stable_reorthogonalize(self, U, V):
-        """Stable reorthogonalization of U and V matrices"""
-        # Use QR decomposition for stability
-        U_q, U_r = np.linalg.qr(U)
-        V_q, V_r = np.linalg.qr(V)
-        
-        # Ensure proper orientation
-        signs = np.sign(np.diagonal(U_r))
-        U_q = U_q * signs
-        V_q = V_q * signs
-        
-        return U_q, V_q
+        return u, v
 
     def create_quantum_matrix_circuit(self, input_vector):
         """Create quantum circuit for matrix-vector multiplication with improved encoding
@@ -518,10 +415,14 @@ class QSVDNoiseEnv(gym.Env):
         Returns:
             QuantumCircuit: Circuit implementing matrix multiplication
         """
+        print(f"\nCreating quantum circuit:")
+        print(f"Number of qubits: {self.n_qubits*2 + 1} (including auxiliary)")
+        
         # Create circuit with quantum and classical registers
         q_reg = QuantumRegister(self.n_qubits * 2, 'q')
         aux_reg = QuantumRegister(1, 'aux')  # Auxiliary qubit for controlled operations
-        c_reg = ClassicalRegister(2 * self.n_qubits + 1, 'c')  # +1 for aux measurement
+        # Classical register size matches quantum register size plus aux
+        c_reg = ClassicalRegister(self.n_qubits * 2 + 1, 'c')
         circuit = QuantumCircuit(q_reg, aux_reg, c_reg)
         
         # Initialize auxiliary qubit in superposition
@@ -529,6 +430,7 @@ class QSVDNoiseEnv(gym.Env):
         
         # Improved vector encoding using amplitude encoding
         self._amplitude_encode_vector(circuit, input_vector, range(self.n_qubits))
+        print(f"Vector encoded, initial circuit depth: {circuit.depth()}")
         
         # Store parameters for matrix elements
         self.circuit_parameters = []
@@ -556,6 +458,9 @@ class QSVDNoiseEnv(gym.Env):
             circuit.cx(q_reg[i], aux_reg[0])
             circuit.h(q_reg[i + self.n_qubits])
         
+        print(f"Added {len(self.circuit_parameters)} parameters")
+        print(f"Final circuit depth: {circuit.depth()}")
+        
         # Add barrier for measurement protection
         circuit.barrier()
         
@@ -564,7 +469,7 @@ class QSVDNoiseEnv(gym.Env):
         
         # Measure quantum registers
         for i in range(self.n_qubits * 2):
-            circuit.measure(q_reg[i], c_reg[i + 1])  # Offset by 1 for aux measurement
+            circuit.measure(q_reg[i], c_reg[i + 1])
         
         return circuit
 
@@ -579,11 +484,6 @@ class QSVDNoiseEnv(gym.Env):
         # Convert qubits to list
         qubits = list(qubits)
         
-        # Ensure vector is a numpy array and handle scalar case
-        vector = np.atleast_1d(vector)
-        if vector.size == 1:
-            vector = np.array([vector[0], 0])  # Pad single value with zero
-        
         # Normalize vector
         vector = vector / np.linalg.norm(vector)
         n_qubits = len(qubits)
@@ -591,7 +491,7 @@ class QSVDNoiseEnv(gym.Env):
         # Pad vector to power of 2
         padded_length = 2**n_qubits
         padded_vector = np.zeros(padded_length)
-        padded_vector[:vector.size] = vector[:padded_length]  # Ensure we don't exceed padded length
+        padded_vector[:len(vector)] = vector
         
         # Apply quantum Fourier transform
         self._apply_qft(circuit, qubits)
@@ -661,94 +561,108 @@ class QSVDNoiseEnv(gym.Env):
             if bit == '0':
                 circuit.x(qubits[i])
 
-    def _execute_quantum_circuit(self, circuit, shots=1000, use_saved_params=False):
-        """Execute quantum circuit with improved parameter handling"""
+    def _execute_quantum_circuit(self, circuit, shots=1000):
+        """Execute quantum circuit with parameter binding and error mitigation
+        
+        Args:
+            circuit (QuantumCircuit): Circuit to execute
+            shots (int): Number of shots for execution
+            
+        Returns:
+            ndarray: Resulting quantum state vector
+        """
+        # Configure backend
         backend = AerSimulator()
         
-        # Bind parameters with bounds checking
+        # Bind parameters if they exist
         if hasattr(self, 'circuit_parameters') and circuit.parameters:
-            param_dict = {}
-            for param in circuit.parameters:
-                if use_saved_params and hasattr(self, 'param_values') and param in self.param_values:
-                    value = self.param_values[param]
-                else:
-                    value = np.random.uniform(-0.1, 0.1)
-                    if hasattr(self, 'param_values'):
-                        self.param_values[param] = value
-                # Ensure parameters are within valid range
-                param_dict[param] = np.clip(value, -np.pi, np.pi)
-            
+            # Generate random parameter values (you might want to make this more sophisticated)
+            param_values = np.random.uniform(-np.pi, np.pi, len(self.circuit_parameters))
+            param_dict = dict(zip(self.circuit_parameters, param_values))
             circuit = circuit.assign_parameters(param_dict)
         
-        # Add barrier using new Qiskit API
-        if not circuit.data or circuit.data[-1].operation.name != 'barrier':
+        # Add barrier before measurements if not already present
+        if circuit.data[-1].operation.name != 'barrier':
             circuit.barrier()
         
-        # Error mitigation with weighted averaging
+        # Multiple circuit executions for error mitigation
         results = []
-        weights = []
-        
-        for _ in range(5):
-            try:
-                job = backend.run(circuit, shots=shots)
-                result = job.result()
+        for _ in range(3):  # Multiple runs for better accuracy
+            job = backend.run(circuit, shots=shots)
+            result = job.result()
             counts = result.get_counts()
+            # Convert counts to vector
             vector = self._counts_to_vector(counts)
-                norm = np.linalg.norm(vector)
-                
-                if norm > 1e-10:  # Only include valid results
             results.append(vector)
-                    weights.append(norm)
-            except Exception as e:
-                print(f"Circuit execution error: {e}")
-                continue
         
-        if not results:  # If all executions failed
-            return np.random.randn(2**self.n_qubits)
-        
-        # Weighted average with normalization
-        weights = np.array(weights)
-        weights = weights / np.sum(weights)
-        result = np.average(results, axis=0, weights=weights)
-        
-        # Ensure result is properly normalized
-        norm = np.linalg.norm(result)
-        if norm > 1e-10:
-            result = result / norm
-        
-        return result
+        # Average results for error mitigation
+        return np.mean(results, axis=0)
 
     def _counts_to_vector(self, counts):
-        """Convert quantum measurement counts to vector"""
-        vector = np.zeros(2**self.n_qubits)
+        """Convert quantum measurement counts to vector
+        
+        Args:
+            counts (dict): Measurement counts from quantum circuit
+            
+        Returns:
+            ndarray: Reconstructed vector from measurements
+        """
+        vector = np.zeros(2**self.n_qubits)  # Initialize vector with correct size
         total_shots = sum(counts.values())
+        valid_counts = 0
+        errors = 0
         
         for bitstring, count in counts.items():
-            # Ensure bitstring is the correct length
-            bitstring = bitstring.zfill(2 * self.n_qubits + 1)  # +1 for aux qubit
-            # Take only the relevant part of the bitstring for the output register
-            # Skip the first bit (aux) and take the second half of remaining bits
-            output_bitstring = bitstring[self.n_qubits + 1:]
-            index = int(output_bitstring, 2)
-            vector[index] = np.sqrt(count / total_shots)
+            try:
+                # Ensure bitstring is the correct length
+                bitstring = bitstring.zfill(2 * self.n_qubits + 1)  # +1 for aux qubit
+                # Take only the relevant part of the bitstring (output register)
+                output_bitstring = bitstring[self.n_qubits+1:2*self.n_qubits+1]  # Skip aux qubit and input register
+                index = int(output_bitstring, 2)
+                if index < len(vector):  # Safety check
+                    vector[index] = np.sqrt(count / total_shots)
+                    valid_counts += 1
+            except ValueError as e:
+                print(f"Warning: Invalid bitstring format: {bitstring}")
+                errors += 1
+                continue
+            except IndexError as e:
+                print(f"Warning: Index {index} out of bounds for vector size {len(vector)}")
+                errors += 1
+                continue
+        
+        print(f"Processed {valid_counts}/{total_shots} valid measurements ({errors} errors)")
+        
+        # Normalize the vector
+        norm = np.linalg.norm(vector)
+        if norm > 1e-10:
+            vector = vector / norm
+            print(f"Vector normalized, norm: {norm:.6f}")
+        else:
+            print("Warning: Vector norm near zero")
         
         return vector
 
     def compute_quantum_reward(self, quantum_state, action):
         """Compute reward based on quantum measurements only"""
+        print("\nComputing quantum reward:")
         # Quantum fidelity measurement
         fidelity = self._measure_quantum_fidelity(quantum_state)
+        print(f"Fidelity: {fidelity:.6f}")
         
         # Circuit complexity penalty
         depth_penalty = -0.1 * self._count_quantum_operations(action)
+        print(f"Depth penalty: {depth_penalty:.6f}")
         
         # Quantum state purity measure
         purity = self._measure_state_purity(quantum_state)
+        print(f"State purity: {purity:.6f}")
         
         # Combined quantum-native reward
         reward = (0.5 * fidelity + 
                  0.3 * purity + 
                  0.2 * depth_penalty)
+        print(f"Final reward: {reward:.6f}")
         
         return reward
 
@@ -927,9 +841,6 @@ class QSVDNoiseEnv(gym.Env):
                 for j, bit in enumerate(bin_i):
                     if bit == '1':
                         circuit.x(qubits[j])
-
-def add_regularization(matrix, epsilon=1e-8):
-    return matrix + epsilon * np.eye(matrix.shape[0])
 
 class MetricsTracker:
     def __init__(self, window_size=100, env=None):

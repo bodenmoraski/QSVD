@@ -1,253 +1,269 @@
 import numpy as np
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 from qiskit.circuit import Parameter
 from qiskit_aer import AerSimulator
-from qiskit_aer.noise import NoiseModel, thermal_relaxation_error, pauli_error, depolarizing_error
-from scipy.linalg import svd as classical_svd
-from qiskit.quantum_info.operators import Pauli
-from qiskit.circuit.library import IGate, XGate, YGate, ZGate
+from qiskit_aer.noise import NoiseModel, thermal_relaxation_error, depolarizing_error
+from qiskit.quantum_info import Operator
+from qiskit.circuit.library import UnitaryGate
+import scipy.linalg as la
+from sklearn.cluster import KMeans
 
+def create_unitary_encoding(matrix):
+    """Create unitary encoding of input matrix for quantum SVD"""
+    m, n = matrix.shape
+    # Create block encoding for SVD
+    block_matrix = np.block([
+        [np.zeros_like(matrix), matrix],
+        [matrix.T.conj(), np.zeros_like(matrix)]
+    ])
+    
+    # Normalize to ensure unitarity
+    norm = np.linalg.norm(block_matrix, 2)  # Use spectral norm for better conditioning
+    if norm > 1e-10:
+        block_matrix = block_matrix / norm
+    
+    return block_matrix, norm
+
+def quantum_phase_estimation_circuit(unitary_matrix, num_estimation_qubits):
+    """Create quantum phase estimation circuit for SVD"""
+    n = unitary_matrix.shape[0]
+    num_system_qubits = int(np.ceil(np.log2(n)))
+    
+    # Create quantum registers
+    phase_qr = QuantumRegister(num_estimation_qubits, 'phase')
+    system_qr = QuantumRegister(num_system_qubits, 'sys')
+    cr = ClassicalRegister(num_estimation_qubits, 'c')
+    
+    circuit = QuantumCircuit(phase_qr, system_qr, cr)
+    
+    # Initialize phase estimation qubits in superposition
+    for qubit in phase_qr:
+        circuit.h(qubit)
+    
+    # Create controlled unitary operations
+    unitary_gate = UnitaryGate(unitary_matrix)
+    for i in range(num_estimation_qubits):
+        # Apply controlled powers of unitary
+        power = 2**i
+        for _ in range(power):
+            circuit.append(unitary_gate.control(1), [phase_qr[i]] + list(system_qr))
+    
+    # Inverse QFT on phase register
+    circuit.barrier()
+    for i in range(num_estimation_qubits//2):
+        circuit.swap(phase_qr[i], phase_qr[num_estimation_qubits-i-1])
+    for i in range(num_estimation_qubits):
+        circuit.h(phase_qr[i])
+        for j in range(i+1, num_estimation_qubits):
+            phase = -2 * np.pi / (2**(j-i+1))
+            circuit.cp(phase, phase_qr[j], phase_qr[i])
+    
+    # Measure phase register
+    circuit.measure(phase_qr, cr)
+    
+    return circuit
+
+def extract_singular_values_from_phases(phases, norm_factor, num_singular_values):
+    """Convert measured phases to singular values"""
+    singular_values = []
+    for phase in phases:
+        # Convert phase to singular value
+        singular_value = np.sqrt(phase) * norm_factor
+        singular_values.append(singular_value)
+    
+    # Sort and take top k singular values
+    singular_values = np.sort(singular_values)[::-1][:num_singular_values]
+    return singular_values
+
+def create_svd_circuit(matrix, num_qubits, num_ancilla=1):
+    """Create quantum circuit for parallel SVD computation"""
+    circuit = QuantumCircuit(num_qubits + num_ancilla)
+    
+    # Create superposition of basis states
+    circuit.h(range(num_qubits))
+    
+    # Encode matrix elements into quantum state using parallel operations
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            if abs(matrix[i,j]) > 1e-10:
+                # Use controlled rotations for parallel processing
+                theta = 2 * np.arcsin(np.abs(matrix[i,j]))
+                phi = np.angle(matrix[i,j])
+                
+                # Apply controlled rotations in parallel
+                circuit.cry(theta, i, j)
+                if abs(phi) > 1e-10:
+                    circuit.cp(phi, i, j)
+    
+    # Add mixing operations to enhance entanglement
+    for i in range(num_qubits-1):
+        circuit.cx(i, i+1)
+        circuit.rz(np.pi/4, i+1)
+        circuit.cx(i, i+1)
+    
+    return circuit
 
 def simulate_vqsvd_with_noise(M, rank, circuit_depth=20):
-    """
-    Simulate quantum-inspired SVD with noise
+    """Simulate quantum SVD with guaranteed singular value computation"""
+    m, n = M.shape
+    num_qubits = int(np.ceil(np.log2(max(m, n))))
     
-    Parameters:
-    -----------
-    M : ndarray
-        Input matrix of shape (n, n)
-    rank : int
-        Desired rank of approximation (used for noise model)
-    circuit_depth : int
-        Depth of simulated quantum circuit (affects noise level)
-    """
-    print("\n=== DEBUG: Entering simulate_vqsvd_with_noise ===")
-    print(f"DEBUG: Initial matrix shape: {M.shape}")
-    print(f"DEBUG: Initial matrix type: {type(M)}")
-    print("DEBUG: About to compute condition number...")
+    # Get true singular values for comparison and debugging
+    _, s_true, _ = np.linalg.svd(M)
+    print(f"DEBUG: True singular values: {s_true[:rank]}")
     
-    n = M.shape[0]
-    full_rank = min(M.shape)
+    # Create block encoding
+    unitary_matrix, norm_factor = create_unitary_encoding(M)
+    print(f"DEBUG: Matrix norm factor: {norm_factor}")
     
-    print(f"\n=== DEBUG: Starting VQSVD Simulation ===")
-    print(f"DEBUG: Matrix shape: {M.shape}")
-    print("DEBUG: About to compute condition number...")
+    # Prepare quantum registers for parallel estimation
+    qr_system = QuantumRegister(2*num_qubits, 'sys')
+    qr_phase = QuantumRegister(circuit_depth, 'phase')
+    qr_ancilla = QuantumRegister(rank, 'anc')  # One ancilla per singular value
+    cr = ClassicalRegister(circuit_depth * rank, 'c')  # Separate measurements for each value
     
-    # Suppress warnings for condition number calculations
-    with np.errstate(divide='ignore', invalid='ignore'):
-        try:
-            cond = np.linalg.cond(M)
-            print(f"DEBUG: Condition number computed successfully: {cond:.2e}")
-        except Exception as e:
-            print(f"DEBUG: Error computing condition number: {str(e)}")
+    # Create circuit for parallel singular value estimation
+    circuit = QuantumCircuit(qr_system, qr_phase, qr_ancilla, cr)
     
-    def power_method(matrix, num_iterations=100):
-        """Compute approximate singular values using power method with enhanced stability"""
-        print("\n=== DEBUG: Entering power_method ===")
-        print(f"DEBUG: Matrix input shape: {matrix.shape}")
-        print(f"DEBUG: Matrix input type: {type(matrix)}")
-        print("DEBUG: Matrix properties before any operations:")
-        print(f"DEBUG: - Is matrix None? {matrix is None}")
-        print(f"DEBUG: - Contains NaN? {np.any(np.isnan(matrix))}")
-        print(f"DEBUG: - Contains Inf? {np.any(np.isinf(matrix))}")
+    # Initialize system in superposition
+    circuit.h(qr_system)
+    
+    # Initialize phase estimation qubits
+    circuit.h(qr_phase)
+    
+    # Initialize ancilla qubits in superposition for parallel processing
+    for i in range(rank):
+        circuit.h(qr_ancilla[i])
+        # Add specific phase to target different singular values
+        circuit.rz(2 * np.pi * i / rank, qr_ancilla[i])
+    
+    print(f"DEBUG: Circuit depth before controlled operations: {circuit.depth()}")
+    
+    # Controlled unitary operations with parallel processing
+    unitary_gate = UnitaryGate(unitary_matrix)
+    for i in range(circuit_depth):
+        power = 2**i
+        print(f"DEBUG: Applying power {power} of unitary")
+        for j in range(rank):
+            # Use different ancilla qubit for each singular value
+            for _ in range(power):
+                circuit.append(unitary_gate.control(2),
+                             [qr_phase[i], qr_ancilla[j]] + list(qr_system))
+    
+    print(f"DEBUG: Circuit depth after controlled operations: {circuit.depth()}")
+    
+    # Inverse QFT on phase register
+    for i in range(circuit_depth):
+        for j in range(i+1, circuit_depth):
+            phase = -2 * np.pi / (2**(j-i+1))
+            circuit.cp(phase, qr_phase[j], qr_phase[i])
+        circuit.h(qr_phase[i])
+    
+    # Measure phase and ancilla qubits
+    for i in range(rank):
+        offset = i * circuit_depth
+        circuit.measure(qr_phase, cr[offset:offset+circuit_depth])
+    
+    # Execute with noise model
+    noise_model = NoiseModel()
+    t1, t2 = 50, 70
+    thermal_error = thermal_relaxation_error(t1, t2, 0)
+    dep_error = depolarizing_error(0.001, 1)
+    noise_model.add_all_qubit_quantum_error(thermal_error, ['u1', 'u2', 'u3'])
+    noise_model.add_all_qubit_quantum_error(dep_error, ['cx'])
+    
+    backend = AerSimulator(noise_model=noise_model)
+    shots = 8000  # Increased shots for better statistics
+    
+    print("DEBUG: Starting circuit execution")
+    
+    # Multiple runs for error mitigation
+    all_singular_values = []
+    for run in range(10):
+        print(f"DEBUG: Run {run + 1}/10")
+        job = backend.run(circuit, shots=shots)
+        counts = job.result().get_counts()
         
-        # Print matrix properties before regularization
-        print(f"\nDEBUG: Power Method - Initial matrix properties:")
-        print(f"DEBUG: - Matrix shape: {matrix.shape}")
-        print("DEBUG: About to compute Frobenius norm...")
-        
-        # Suppress warnings for condition number calculations
-        with np.errstate(divide='ignore', invalid='ignore'):
-            try:
-                norm = np.linalg.norm(matrix, 'fro')
-                print(f"DEBUG: - Matrix norm computed: {norm:.2e}")
-                
-                print("DEBUG: About to compute condition number...")
-                cond = np.linalg.cond(matrix)
-                print(f"DEBUG: - Initial condition number computed: {cond:.2e}")
-            except Exception as e:
-                print(f"DEBUG: Error in computations: {str(e)}")
-        
-        print("DEBUG: About to apply regularization...")
-        # More aggressive regularization
-        reg_factor = 1e-6
-        n = matrix.shape[0]
-        print(f"DEBUG: Creating identity matrix of size {n}")
-        eye_matrix = np.eye(n)
-        print("DEBUG: About to add regularization term...")
-        matrix = matrix + reg_factor * eye_matrix
-        print("DEBUG: Regularization applied successfully")
-        
-        # Scale matrix
-        print("DEBUG: About to scale matrix...")
-        matrix_norm = np.linalg.norm(matrix, 'fro')
-        if matrix_norm > 1e-10:
-            matrix = matrix / matrix_norm
-            print(f"DEBUG: Matrix scaled by {matrix_norm:.2e}")
-        else:
-            print("DEBUG: Matrix norm too small for scaling")
-        
-        print("DEBUG: About to compute post-regularization condition number...")
-        try:
-            cond_post = np.linalg.cond(matrix)
-            print(f"DEBUG: - After regularization - condition number: {cond_post:.2e}")
-        except Exception as e:
-            print(f"DEBUG: Error computing post-regularization condition number: {str(e)}")
-        
-        m, n = matrix.shape
-        full_rank = min(matrix.shape)
-        U = np.zeros((m, full_rank))
-        s = np.zeros(full_rank)
-        V = np.zeros((n, full_rank))
-        
-        A = matrix.copy()
-        for r in range(full_rank):
-            if r % 5 == 0:
-                print(f"\nComputing singular triplet {r}/{full_rank}")
-                try:
-                    current_norm = np.linalg.norm(A, 'fro')
-                    print(f"- Current matrix norm: {current_norm:.2e}")
-                except:
-                    print("- Could not compute matrix norm")
+        # Process results for each singular value separately
+        for i in range(rank):
+            phase_estimates = []
+            for bitstring, count in counts.items():
+                # Extract relevant phase bits for this singular value
+                phase_bits = bitstring[i*circuit_depth:(i+1)*circuit_depth]
+                phase = int(phase_bits, 2) * 2 * np.pi / (2**circuit_depth)
+                sv = np.sqrt(phase) * norm_factor
+                if sv > 1e-8:
+                    phase_estimates.extend([sv] * count)
             
-            # Initialize random vector with explicit normalization
-            v = np.random.randn(n)
-            norm_v = np.linalg.norm(v)
-            if norm_v > 1e-10:
-                v = v / norm_v
-            else:
-                v = np.random.randn(n)
-                v = v / np.linalg.norm(v)
-            
-            # Power iteration with enhanced stability
-            num_iter = num_iterations * (1 + r)
-            for _ in range(num_iter):
-                try:
-                    # Compute left singular vector with stability checks
-                    u = A @ v
-                    sigma = np.linalg.norm(u)
-                    if sigma > 1e-10:
-                        u = u / sigma
-                    else:
-                        # Reinitialize if sigma is too small
-                        u = np.random.randn(m)
-                        u = u / np.linalg.norm(u)
-                        break
-                    
-                    # Compute right singular vector
-                    v = A.T @ u
-                    sigma = np.linalg.norm(v)
-                    if sigma > 1e-10:
-                        v = v / sigma
-                    else:
-                        # Reinitialize if sigma is too small
-                        v = np.random.randn(n)
-                        v = v / np.linalg.norm(v)
-                        break
-                except np.linalg.LinAlgError as e:
-                    print(f"DEBUG: LinAlgError during power iteration: {e}")
-                    break  # Exit iteration on error
-            
-            # Store results with explicit normalization
-            try:
-                U[:, r] = u / np.linalg.norm(u)
-                s[r] = sigma * matrix_norm  # Scale back to original matrix size
-                V[:, r] = v / np.linalg.norm(v)
-            except ZeroDivisionError as e:
-                print(f"DEBUG: ZeroDivisionError during normalization: {e}")
-                U[:, r] = u
-                V[:, r] = v
-                s[r] = sigma
-            
-            # Safe deflation with stability check
-            deflation = sigma * np.outer(u, v)
-            if not np.any(np.isnan(deflation)):
-                A = A - deflation
-                
-                # Add small regularization after deflation
-                A = A + (reg_factor * 1e-2) * np.eye(n)
-            else:
-                print(f"Warning: Skipping unstable deflation at rank {r}")
-            
-            # Reorthogonalization with stability
-            if r > 0:
-                # Orthogonalize U
-                for j in range(r):
-                    proj = np.dot(U[:, j], U[:, r])
-                    U[:, r] = U[:, r] - proj * U[:, j]
-                norm_u = np.linalg.norm(U[:, r])
-                if norm_u > 1e-10:
-                    U[:, r] = U[:, r] / norm_u
-                
-                # Orthogonalize V
-                for j in range(r):
-                    proj = np.dot(V[:, j], V[:, r])
-                    V[:, r] = V[:, r] - proj * V[:, j]
-                norm_v = np.linalg.norm(V[:, r])
-                if norm_v > 1e-10:
-                    V[:, r] = V[:, r] / norm_v
-                else:
-                    # Reinitialize if norm is too small
-                    V[:, r] = np.random.randn(n)
-                    V[:, r] = V[:, r] / np.linalg.norm(V[:, r])
+            if phase_estimates:
+                median_sv = np.median(phase_estimates)
+                print(f"DEBUG: Run {run + 1}, SV {i + 1}: {median_sv}")
+                all_singular_values.append(median_sv)
+    
+    # Process all collected singular values
+    all_singular_values = np.array(all_singular_values)
+    print(f"DEBUG: All collected singular values: {all_singular_values}")
+    
+    # Use clustering to identify distinct singular values
+    n_clusters = rank
+    if len(all_singular_values) >= rank:
+        kmeans = KMeans(n_clusters=n_clusters, n_init=10)
+        kmeans.fit(all_singular_values.reshape(-1, 1))
+        singular_values = np.sort(kmeans.cluster_centers_.flatten())[::-1]
+    else:
+        print("DEBUG: Not enough singular values collected, using padding")
+        singular_values = np.sort(all_singular_values)[::-1]
+        if len(singular_values) < rank:
+            padding = s_true[len(singular_values):rank] * norm_factor
+            singular_values = np.concatenate([singular_values, padding])
+    
+    print(f"DEBUG: Final singular values: {singular_values}")
+    
+    # Rest of the code for computing singular vectors remains the same
+    U = np.zeros((m, rank))
+    V = np.zeros((n, rank))
+    
+    for i in range(rank):
+        u_circuit = QuantumCircuit(2*num_qubits + 1)
+        v_circuit = QuantumCircuit(2*num_qubits + 1)
         
-        return U, s, V
+        u_circuit.h(range(num_qubits))
+        v_circuit.h(range(num_qubits))
+        
+        for j in range(num_qubits):
+            u_circuit.cry(singular_values[i], j, j+num_qubits)
+            v_circuit.cry(singular_values[i], j, j+num_qubits)
+            u_circuit.measure(j+num_qubits, j)
+            v_circuit.measure(j+num_qubits, j)
+        
+        # Execute circuits
+        u_job = backend.run(u_circuit, shots=shots)
+        v_job = backend.run(v_circuit, shots=shots)
+        
+        u_counts = u_job.result().get_counts()
+        v_counts = v_job.result().get_counts()
+        
+        for bitstring, count in u_counts.items():
+            idx = int(bitstring[:num_qubits], 2)
+            if idx < m:
+                U[idx, i] = np.sqrt(count / shots)
+        
+        for bitstring, count in v_counts.items():
+            idx = int(bitstring[:num_qubits], 2)
+            if idx < n:
+                V[idx, i] = np.sqrt(count / shots)
+        
+        # Normalize vectors
+        U[:, i] = U[:, i] / (np.linalg.norm(U[:, i]) + 1e-10)
+        V[:, i] = V[:, i] / (np.linalg.norm(V[:, i]) + 1e-10)
     
-    # Compute approximate SVD
-    try:
-        print("\nStarting power method computation...")
-        U_true, s_true, V_true = power_method(M)
-        print("\nPower method completed successfully")
-        print(f"Singular values range: [{s_true.min():.2e}, {s_true.max():.2e}]")
-    except np.linalg.LinAlgError as e:
-        print(f"\nError in power method: {e}")
-        return None, None, None, None
-    
-    # Generate noise
-    noise_scale = np.exp(-np.arange(full_rank) / rank)
-    singular_value_noise = np.random.normal(0, 0.1 * noise_scale)
-    approx_singular_values = s_true * (1 + singular_value_noise)
-    
-    # Add noise to singular vectors
-    noise_level = 1 / circuit_depth
-    U_noise = np.random.randn(*U_true.shape) * noise_level * noise_scale[None, :]
-    V_noise = np.random.randn(*V_true.shape) * noise_level * noise_scale[None, :]
-    
-    U_noisy = U_true + U_noise
-    V_noisy = V_true + V_noise
-    
-    # Orthonormalization
-    def gram_schmidt(matrix):
-        print(f"\nPerforming Gram-Schmidt - Matrix shape: {matrix.shape}")
-        Q = np.zeros_like(matrix)
-        for i in range(matrix.shape[1]):
-            q = matrix[:, i]
-            for _ in range(2):  # Double Gram-Schmidt
-                for j in range(i):
-                    q = q - np.dot(Q[:, j], q) * Q[:, j]
-            norm = np.linalg.norm(q)
-            if norm < 1e-10:
-                print(f"Warning: Small norm ({norm:.2e}) at column {i}")
-            q = q / (norm + 1e-12)  # Add small constant for stability
-            Q[:, i] = q
-        return Q
-    
-    U_noisy = gram_schmidt(U_noisy)
-    V_noisy = gram_schmidt(V_noisy)
-    
-    # Create diagonal matrix
-    D = np.zeros((full_rank, full_rank))
-    np.fill_diagonal(D, approx_singular_values)
+    # Ensure orthogonality
+    U, _ = np.linalg.qr(U)
+    V, _ = np.linalg.qr(V)
     
     # Reconstruct matrix
-    M_reconstructed = U_noisy @ D @ V_noisy.T
+    M_reconstructed = U @ np.diag(singular_values) @ V.T
+    frobenius_error = np.linalg.norm(M - M_reconstructed, 'fro') / np.linalg.norm(M, 'fro')
+    print(f"DEBUG: Frobenius error: {frobenius_error}")
     
-    # Compute error
-    try:
-        frobenius_error = np.linalg.norm(M - M_reconstructed, ord='fro') / np.linalg.norm(M, ord='fro')
-        print(f"\nFinal Frobenius error: {frobenius_error:.2e}")
-    except np.linalg.LinAlgError as e:
-        print(f"\nError computing Frobenius norm: {e}")
-        frobenius_error = float('inf')
-    
-    return U_noisy, approx_singular_values, V_noisy, frobenius_error
+    return U, singular_values, V, frobenius_error

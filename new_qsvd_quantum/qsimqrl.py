@@ -80,9 +80,11 @@ class QSVDNoiseEnv(gym.Env):
         self.reset()
 
     def _compute_reference_singular_values(self, matrix, num_values, num_iterations=100):
-        """Compute approximate singular values using power method"""
+        """Compute approximate singular values using improved power method with reorthogonalization"""
         m, n = matrix.shape
         singular_values = np.zeros(num_values)
+        U = np.zeros((m, num_values))
+        V = np.zeros((n, num_values))
         A = matrix.copy()
         
         for i in range(num_values):
@@ -90,25 +92,47 @@ class QSVDNoiseEnv(gym.Env):
             v = np.random.randn(n)
             v = v / np.linalg.norm(v)
             
-            # Power iteration
+            # Orthogonalize against previous vectors
+            if i > 0:
+                v = v - V[:, :i] @ (V[:, :i].T @ v)
+                v = v / np.linalg.norm(v)
+            
+            # Power iteration with reorthogonalization
             for _ in range(num_iterations * (i + 1)):  # More iterations for smaller values
                 # Compute left singular vector
                 u = A @ v
+                
+                # Reorthogonalize against previous left vectors
+                if i > 0:
+                    u = u - U[:, :i] @ (U[:, :i].T @ u)
+                
                 sigma = np.linalg.norm(u)
                 if sigma > 1e-10:
                     u = u / sigma
                 
                 # Compute right singular vector
                 v = A.T @ u
+                
+                # Reorthogonalize against previous right vectors
+                if i > 0:
+                    v = v - V[:, :i] @ (V[:, :i].T @ v)
+                
                 sigma = np.linalg.norm(v)
                 if sigma > 1e-10:
                     v = v / sigma
             
-            # Store singular value
-            singular_values[i] = sigma
+            # Store results
+            singular_values[i] = np.sqrt(u.T @ (A @ A.T) @ u)  # More accurate singular value
+            U[:, i] = u
+            V[:, i] = v
             
-            # Deflate matrix
-            A = A - sigma * np.outer(u, v)
+            # Deflate using projection method instead of direct subtraction
+            A = A - singular_values[i] * np.outer(u, v)
+            
+            # Additional stabilization: project out components in the direction of found vectors
+            if i > 0:
+                A = A - U[:, :i+1] @ (U[:, :i+1].T @ A)
+                A = A - (A @ V[:, :i+1]) @ V[:, :i+1].T
         
         return singular_values
 
@@ -252,121 +276,191 @@ class QSVDNoiseEnv(gym.Env):
         s = np.zeros(self.rank)
         V = np.zeros((n, self.rank))
         
-        # Store original matrix for reorthogonalization
-        A = matrix.copy()
-        A_original = matrix.copy()
+        # Estimate matrix scale using quantum sampling
+        scale_factor = self._estimate_matrix_scale(matrix)
+        print(f"Estimated matrix scale: {scale_factor:.6f}")
         
-        # Initialize noise parameters with faster decay
-        noise_scale = 0.01
-        noise_decay = 0.8  # Faster decay
-        max_iterations_per_value = min(100, num_iterations)  # Cap maximum iterations
-        print(f"Initial noise scale: {noise_scale}, Max iterations per value: {max_iterations_per_value}")
+        # Store original matrix and maintain working copy
+        A_original = matrix.copy()
+        A_working = matrix.copy()
+        
+        # Initialize noise parameters
+        base_noise_scale = 0.01
+        noise_decay = 0.8
+        max_iterations_per_value = min(100, num_iterations)
+        
+        # Keep track of previous singular values for adaptive scaling
+        prev_singular_values = []
         
         for r in range(self.rank):
             print(f"\nComputing singular value {r+1}/{self.rank}")
-            # Initialize with improved starting vector
-            v = np.random.randn(n)
-            v = v / np.linalg.norm(v)
             
-            # Use fixed number of iterations with early stopping
-            current_iterations = max_iterations_per_value
-            print(f"Planning {current_iterations} iterations for this value")
+            # Reset working matrix for each singular value to reduce error accumulation
+            A_working = A_original.copy()
+            if r > 0:
+                # Project out previous singular vectors more carefully
+                for i in range(r):
+                    # Use stabilized projection
+                    proj_u = U[:, i].reshape(-1, 1)
+                    proj_v = V[:, i].reshape(-1, 1)
+                    A_working = A_working - s[i] * (proj_u @ proj_v.T)
             
+            # Adjust noise scale based on matrix norm
+            current_norm = np.linalg.norm(A_working, ord=2)
+            noise_scale = base_noise_scale * (current_norm / scale_factor)
+            print(f"Current matrix norm: {current_norm:.6f}, noise scale: {noise_scale:.2e}")
+            
+            # Initialize with quantum-inspired starting vector
+            if r == 0:
+                v = self._quantum_sample_initial_vector(A_working, n)
+            else:
+                # Use modified initialization for subsequent vectors
+                v = np.random.randn(n)
+                # Project out previous singular vectors
+                for i in range(r):
+                    v = v - np.dot(v, V[:, i]) * V[:, i]
+                v = v / np.linalg.norm(v)
+            
+            best_sigma = 0
+            best_u = None
+            best_v = None
             prev_sigma = float('inf')
             convergence_count = 0
-            min_sigma_diff = float('inf')
-            no_improvement_count = 0
             
-            for iter in range(current_iterations):
-                # Create and execute quantum circuits with noise mitigation
+            # Power iteration with enhanced stability
+            for iter in range(max_iterations_per_value):
+                # Matrix-vector multiplication with current matrix
                 circuit_u = self.create_quantum_matrix_circuit(v)
                 u = self._execute_quantum_circuit(circuit_u)
-                sigma = np.linalg.norm(u)
+                sigma_u = np.linalg.norm(u)
                 
-                if iter % 10 == 0:  # Print progress periodically
-                    print(f"Iteration {iter}: σ = {sigma:.6f}")
-                
-                if sigma > 1e-10:
-                    u = u / sigma
-                    
-                    # Reorthogonalize against previous singular vectors
+                if sigma_u > 1e-10:
+                    u = u / sigma_u
+                    # Orthogonalize against previous vectors
                     if r > 0:
+                        u_orig = u.copy()
                         for i in range(r):
-                            u = u - np.dot(U[:, i], u) * U[:, i]
+                            u = u - np.dot(u, U[:, i]) * U[:, i]
+                        # If orthogonalization reduced norm too much, restore and try again
+                        if np.linalg.norm(u) < 0.1:
+                            u = u_orig
+                            for i in range(r):
+                                u = u - np.dot(u, U[:, i]) * U[:, i]
                         u = u / np.linalg.norm(u)
                 
                 circuit_v = self.create_quantum_matrix_circuit(u)
                 v = self._execute_quantum_circuit(circuit_v)
-                sigma = np.linalg.norm(v)
+                sigma_v = np.linalg.norm(v)
                 
-                if sigma > 1e-10:
-                    v = v / sigma
-            
-                    # Reorthogonalize against previous singular vectors
+                if sigma_v > 1e-10:
+                    v = v / sigma_v
+                    # Similar orthogonalization for v
                     if r > 0:
+                        v_orig = v.copy()
                         for i in range(r):
-                            v = v - np.dot(V[:, i], v) * V[:, i]
+                            v = v - np.dot(v, V[:, i]) * V[:, i]
+                        if np.linalg.norm(v) < 0.1:
+                            v = v_orig
+                            for i in range(r):
+                                v = v - np.dot(v, V[:, i]) * V[:, i]
                         v = v / np.linalg.norm(v)
                 
-                # Improved convergence check
-                sigma_diff = abs(sigma - prev_sigma)
-                min_sigma_diff = min(min_sigma_diff, sigma_diff)
+                # Compute Rayleigh quotient for better accuracy
+                sigma = np.abs(u.T @ A_working @ v)
                 
-                # Check for convergence with more lenient criteria
-                if sigma_diff < 1e-4:  # More lenient threshold
+                if iter % 10 == 0:
+                    print(f"Iteration {iter}: σ = {sigma:.6f}")
+                
+                # Update best solution if better
+                if sigma > best_sigma:
+                    best_sigma = sigma
+                    best_u = u.copy()
+                    best_v = v.copy()
+                
+                # Check convergence
+                rel_diff = abs(sigma - prev_sigma) / (prev_sigma + 1e-10)
+                if rel_diff < 1e-6:
                     convergence_count += 1
-                    if convergence_count >= 2:  # Fewer consecutive improvements needed
-                        print(f"Converged after {iter+1} iterations (diff: {sigma_diff:.2e})")
+                    if convergence_count >= 2:
+                        print(f"Converged after {iter+1} iterations")
                         break
                 else:
                     convergence_count = 0
                 
-                # Check for lack of improvement
-                if sigma_diff > min_sigma_diff * 1.1:  # No significant improvement
-                    no_improvement_count += 1
-                else:
-                    no_improvement_count = 0
-                
-                # Early stopping if no improvement
-                if no_improvement_count >= 5:
-                    print(f"Stopping early due to lack of improvement at iteration {iter+1}")
-                    break
-                
                 prev_sigma = sigma
-            
-                # Add controlled noise with faster decay
-                if iter > 0 and iter % 5 == 0:  # More frequent noise application
-                    noise = np.random.randn(*v.shape) * noise_scale
-                    v = v + noise
+                
+                # Add controlled noise to escape local minima
+                if iter > 0 and iter % 5 == 0:
+                    noise_magnitude = noise_scale * (1 - iter/max_iterations_per_value)
+                    v = v + np.random.randn(n) * noise_magnitude
                     v = v / np.linalg.norm(v)
-                    noise_scale *= noise_decay
-                    print(f"Applied noise, new scale: {noise_scale:.2e}")
             
-            # Store converged vectors and value
-            U[:, r] = u
-            s[r] = sigma
-            V[:, r] = v
-            print(f"Singular value {r+1} = {sigma:.6f}")
-        
-            # Quantum deflation with improved stability
-            deflation_matrix = sigma * np.outer(u, v)
-            A = A - deflation_matrix
+            # Store results
+            U[:, r] = best_u
+            s[r] = best_sigma
+            V[:, r] = best_v
+            prev_singular_values.append(best_sigma)
             
-            # Periodic reorthogonalization against original matrix
-            if r > 0 and r % 2 == 0:
-                A = A_original.copy()
-                for i in range(r+1):
-                    A = A - s[i] * np.outer(U[:, i], V[:, i])
-                print("Performed periodic reorthogonalization")
+            print(f"Found singular value {r+1}: {best_sigma:.6f}")
             
-            # Verify orthogonality and fix if necessary
+            # Verify orthogonality
             if r > 0:
                 U[:, r], V[:, r] = self._ensure_orthogonality(U[:, :r+1], V[:, :r+1], r)
         
         error = np.linalg.norm(matrix - U @ np.diag(s) @ V.T)
-        print(f"\nFinal reconstruction error: {error:.6f}")
+        relative_error = error / np.linalg.norm(matrix)
+        print(f"\nFinal reconstruction error: {error:.6f} (relative: {relative_error:.6f})")
         print(f"Final singular values: {s}")
         return U, s, V, error
+
+    def _estimate_matrix_scale(self, matrix):
+        """Estimate matrix scale using quantum sampling"""
+        # Sample random vectors and use quantum circuits to estimate largest magnitude
+        n_samples = 10
+        max_magnitude = 0
+        
+        for _ in range(n_samples):
+            # Create random normalized vector
+            v = np.random.randn(matrix.shape[1])
+            v = v / np.linalg.norm(v)
+            
+            # Use quantum circuit to estimate Mv
+            circuit = self.create_quantum_matrix_circuit(v)
+            result = self._execute_quantum_circuit(circuit)
+            magnitude = np.linalg.norm(result)
+            max_magnitude = max(max_magnitude, magnitude)
+        
+        return max_magnitude
+
+    def _quantum_sample_initial_vector(self, matrix, n):
+        """Use quantum sampling to find a good initial vector"""
+        # Create superposition state
+        circuit = QuantumCircuit(self.n_qubits)
+        circuit.h(range(self.n_qubits))  # Put all qubits in superposition
+        
+        # Add some random rotations to create a non-uniform superposition
+        for i in range(self.n_qubits):
+            angle = np.random.uniform(0, np.pi)
+            circuit.ry(angle, i)
+        
+        # Measure
+        circuit.measure_all()
+        
+        # Execute circuit multiple times
+        counts = self._execute_with_error_mitigation(circuit)
+        
+        # Convert measurements to vector
+        v = np.zeros(n)
+        total_shots = sum(counts.values())
+        
+        for bitstring, count in counts.items():
+            index = int(bitstring, 2)
+            if index < n:
+                v[index] = np.sqrt(count / total_shots)
+        
+        # Normalize
+        v = v / np.linalg.norm(v)
+        return v
 
     def _ensure_orthogonality(self, U, V, current_index):
         """Ensure orthogonality of current vectors against previous ones

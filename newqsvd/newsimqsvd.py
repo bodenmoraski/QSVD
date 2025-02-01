@@ -70,15 +70,17 @@ def simulate_vqsvd_with_noise(M, rank, circuit_depth=20):
     # Compute approximate SVD using power method
     U_true, s_true, V_true = power_method(M)
     
-    # Generate noise that decreases for smaller singular values
-    noise_scale = np.exp(-np.arange(full_rank) / rank)  # Exponentially decreasing noise
-    singular_value_noise = np.random.normal(0, 0.1 * noise_scale)
+    # Generate noise that decreases more gradually for smaller singular values
+    noise_scale = 1.0 / (1.0 + np.arange(full_rank))  # Hyperbolic decay instead of exponential
+    base_noise_level = 0.05  # Reduced base noise level
+    singular_value_noise = np.random.normal(0, base_noise_level * noise_scale)
     approx_singular_values = s_true * (1 + singular_value_noise)
     
-    # Add noise to singular vectors with decreasing magnitude
-    noise_level = 1 / circuit_depth
-    U_noise = np.random.randn(*U_true.shape) * noise_level * noise_scale[None, :]
-    V_noise = np.random.randn(*V_true.shape) * noise_level * noise_scale[None, :]
+    # Add noise to singular vectors with more gradual decay
+    noise_level = 0.1 / np.sqrt(circuit_depth)  # Square root scaling for better stability
+    vector_noise_scale = 1.0 / np.sqrt(1.0 + np.arange(full_rank))  # More gradual decay
+    U_noise = np.random.randn(*U_true.shape) * noise_level * vector_noise_scale[None, :]
+    V_noise = np.random.randn(*V_true.shape) * noise_level * vector_noise_scale[None, :]
     
     U_noisy = U_true + U_noise
     V_noisy = V_true + V_noise

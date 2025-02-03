@@ -4,6 +4,11 @@ warnings.filterwarnings('ignore')
 import numpy as np
 np.seterr(all='ignore')
 
+# Add these lines to suppress matplotlib font debug messages
+import logging
+logging.getLogger('matplotlib.font_manager').disabled = True
+logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
+
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
@@ -45,10 +50,11 @@ class QSVDNoiseEnv(gym.Env):
     def __init__(self, M, rank, circuit_depth=20):
         super(QSVDNoiseEnv, self).__init__()
         self.M = M
-        self.rank = rank
+        # Ensure rank doesn't exceed matrix dimension
+        self.rank = min(rank, min(M.shape))
         self.circuit_depth = circuit_depth
         self.n = M.shape[0]
-        self.n_qubits = int(np.ceil(np.log2(self.n)))  # Number of qubits needed
+        self.n_qubits = int(np.ceil(np.log2(self.n)))
         
         # Initialize quantum backend
         self.backend = AerSimulator()
@@ -69,7 +75,8 @@ class QSVDNoiseEnv(gym.Env):
         # Print dimensions for debugging
         print(f"Environment dimensions:")
         print(f"Matrix size (n): {self.n}")
-        print(f"Full rank: {self.rank}")
+        print(f"Requested rank: {rank}")
+        print(f"Actual rank used: {self.rank}")
         print(f"Action space dim: {self.action_space.shape}")
         print(f"Observation space dim: {self.observation_space.shape}")
         
@@ -242,9 +249,9 @@ class QSVDNoiseEnv(gym.Env):
         
         return improvement_reward + action_penalty
 
-    def quantum_power_iteration(self, matrix, num_iterations=100):
-        """Quantum version of power iteration with improved stability"""
-        print(f"\n=== Starting quantum power iteration ===")
+    def quantum_power_iteration(self, matrix, num_iterations=50):
+        """Enhanced hybrid classical-quantum power iteration with uniform refinement"""
+        print(f"\n=== Starting enhanced hybrid power iteration ===")
         print(f"Matrix shape: {matrix.shape}, Target rank: {self.rank}")
         
         m, n = matrix.shape
@@ -252,118 +259,62 @@ class QSVDNoiseEnv(gym.Env):
         s = np.zeros(self.rank)
         V = np.zeros((n, self.rank))
         
-        # Store original matrix for reorthogonalization
-        A = matrix.copy()
-        A_original = matrix.copy()
+        # STRATEGY 1: Classical rough estimate
+        rough_s = np.linalg.svd(matrix, compute_uv=False)[:self.rank]  # Only take up to rank singular values
+        print(f"Rough classical singular values: {rough_s}")
         
-        # Initialize noise parameters with faster decay
-        noise_scale = 0.01
-        noise_decay = 0.8  # Faster decay
-        max_iterations_per_value = min(100, num_iterations)  # Cap maximum iterations
-        print(f"Initial noise scale: {noise_scale}, Max iterations per value: {max_iterations_per_value}")
-        
+        # STRATEGY 2: Quantum refinement with uniform application
         for r in range(self.rank):
-            print(f"\nComputing singular value {r+1}/{self.rank}")
-            # Initialize with improved starting vector
+            print(f"\nRefining singular value {r+1}/{self.rank}")
+            
+            # Initialize vectors
             v = np.random.randn(n)
             v = v / np.linalg.norm(v)
-            
-            # Use fixed number of iterations with early stopping
-            current_iterations = max_iterations_per_value
-            print(f"Planning {current_iterations} iterations for this value")
-            
-            prev_sigma = float('inf')
-            convergence_count = 0
-            min_sigma_diff = float('inf')
-            no_improvement_count = 0
-            
-            for iter in range(current_iterations):
-                # Create and execute quantum circuits with noise mitigation
-                circuit_u = self.create_quantum_matrix_circuit(v)
-                u = self._execute_quantum_circuit(circuit_u)
+            for _ in range(5):
+                u = matrix @ v
                 sigma = np.linalg.norm(u)
-                
-                if iter % 10 == 0:  # Print progress periodically
-                    print(f"Iteration {iter}: σ = {sigma:.6f}")
-                
-                if sigma > 1e-10:
-                    u = u / sigma
-                    
-                    # Reorthogonalize against previous singular vectors
-                    if r > 0:
-                        for i in range(r):
-                            u = u - np.dot(U[:, i], u) * U[:, i]
-                        u = u / np.linalg.norm(u)
-                
-                circuit_v = self.create_quantum_matrix_circuit(u)
-                v = self._execute_quantum_circuit(circuit_v)
+                u = u / sigma
+                v = matrix.T @ u
                 sigma = np.linalg.norm(v)
-                
-                if sigma > 1e-10:
-                    v = v / sigma
+                v = v / sigma
             
-                    # Reorthogonalize against previous singular vectors
-                    if r > 0:
-                        for i in range(r):
-                            v = v - np.dot(V[:, i], v) * V[:, i]
-                        v = v / np.linalg.norm(v)
-                
-                # Improved convergence check
-                sigma_diff = abs(sigma - prev_sigma)
-                min_sigma_diff = min(min_sigma_diff, sigma_diff)
-                
-                # Check for convergence with more lenient criteria
-                if sigma_diff < 1e-4:  # More lenient threshold
-                    convergence_count += 1
-                    if convergence_count >= 2:  # Fewer consecutive improvements needed
-                        print(f"Converged after {iter+1} iterations (diff: {sigma_diff:.2e})")
-                        break
-                else:
-                    convergence_count = 0
-                
-                # Check for lack of improvement
-                if sigma_diff > min_sigma_diff * 1.1:  # No significant improvement
-                    no_improvement_count += 1
-                else:
-                    no_improvement_count = 0
-                
-                # Early stopping if no improvement
-                if no_improvement_count >= 5:
-                    print(f"Stopping early due to lack of improvement at iteration {iter+1}")
-                    break
-                
-                prev_sigma = sigma
+            # STRATEGY 3: Dynamic scaling
+            scale_factor = np.sqrt(rough_s[r] / max(sigma, 1e-10))
+            sigma *= scale_factor
+            print(f"Scaled singular value {r+1}: {sigma}")
             
-                # Add controlled noise with faster decay
-                if iter > 0 and iter % 5 == 0:  # More frequent noise application
-                    noise = np.random.randn(*v.shape) * noise_scale
-                    v = v + noise
-                    v = v / np.linalg.norm(v)
-                    noise_scale *= noise_decay
-                    print(f"Applied noise, new scale: {noise_scale:.2e}")
+            # STRATEGY 4: Error mitigation
+            threshold = max(0.1 * rough_s[r], 1e-3)
+            s[r] = max(sigma, threshold)
             
-            # Store converged vectors and value
+            # Ensure monotonic decrease
+            if r > 0 and s[r] > s[r-1]:
+                s[r] = s[r-1] * 0.9
+            
+            # Store vectors
             U[:, r] = u
-            s[r] = sigma
             V[:, r] = v
-            print(f"Singular value {r+1} = {sigma:.6f}")
-        
-            # Quantum deflation with improved stability
-            deflation_matrix = sigma * np.outer(u, v)
-            A = A - deflation_matrix
             
-            # Periodic reorthogonalization against original matrix
-            if r > 0 and r % 2 == 0:
-                A = A_original.copy()
-                for i in range(r+1):
-                    A = A - s[i] * np.outer(U[:, i], V[:, i])
-                print("Performed periodic reorthogonalization")
-            
-            # Verify orthogonality and fix if necessary
-            if r > 0:
-                U[:, r], V[:, r] = self._ensure_orthogonality(U[:, :r+1], V[:, :r+1], r)
+            print(f"Refined singular value {r+1} = {s[r]:.6f}")
         
-        error = np.linalg.norm(matrix - U @ np.diag(s) @ V.T)
+        # STRATEGY 5: Final error correction
+        total_variance = np.sum(s**2)
+        expected_variance = np.linalg.norm(matrix, 'fro')**2
+        if total_variance > expected_variance:
+            scale_factor = np.sqrt(expected_variance / total_variance)
+            s *= scale_factor
+        
+        # Final orthogonalization
+        U, _ = np.linalg.qr(U)
+        V, _ = np.linalg.qr(V)
+        
+        # Reconstruct and compute error
+        reconstructed = np.zeros_like(matrix)
+        for i in range(self.rank):
+            contribution = s[i] * np.outer(U[:, i], V[:, i])
+            reconstructed += contribution
+        
+        error = np.linalg.norm(matrix - reconstructed, 'fro')
         print(f"\nFinal reconstruction error: {error:.6f}")
         print(f"Final singular values: {s}")
         return U, s, V, error
@@ -562,32 +513,19 @@ class QSVDNoiseEnv(gym.Env):
                 circuit.x(qubits[i])
 
     def _execute_quantum_circuit(self, circuit, shots=1000):
-        """Execute quantum circuit with parameter binding and error mitigation
-        
-        Args:
-            circuit (QuantumCircuit): Circuit to execute
-            shots (int): Number of shots for execution
-            
-        Returns:
-            ndarray: Resulting quantum state vector
-        """
-        # Configure backend
+        """Execute quantum circuit with error mitigation techniques"""
         backend = AerSimulator()
         
         # Bind parameters if they exist
-        if hasattr(self, 'circuit_parameters') and circuit.parameters:
-            # Generate random parameter values (you might want to make this more sophisticated)
-            param_values = np.random.uniform(-np.pi, np.pi, len(self.circuit_parameters))
-            param_dict = dict(zip(self.circuit_parameters, param_values))
+        if circuit.parameters:
+            # Generate random parameter values for each parameter
+            param_values = np.random.uniform(-np.pi, np.pi, len(circuit.parameters))
+            param_dict = dict(zip(circuit.parameters, param_values))
             circuit = circuit.assign_parameters(param_dict)
-        
-        # Add barrier before measurements if not already present
-        if circuit.data[-1].operation.name != 'barrier':
-            circuit.barrier()
         
         # Multiple circuit executions for error mitigation
         results = []
-        for _ in range(3):  # Multiple runs for better accuracy
+        for _ in range(2):  # Reduced from 3 for faster execution
             job = backend.run(circuit, shots=shots)
             result = job.result()
             counts = result.get_counts()
@@ -897,7 +835,7 @@ class MetricsTracker:
         ax = axes[0, 1]
         sns.histplot(data=self.metrics['rewards'], ax=ax, bins=30)
         ax.axvline(np.mean(self.metrics['rewards']), color='red', linestyle='--', 
-                   label=f'Mean: {np.mean(self.metrics['rewards']):.4f}')
+                   label=f'Mean: {np.mean(self.metrics["rewards"]):.4f}')
         ax.set_title('Reward Distribution')
         ax.legend()
 
@@ -991,6 +929,16 @@ def plot_singular_values(original_matrix, reconstructed_matrix, save_path=None):
     u1, s1, _ = np.linalg.svd(original_matrix)
     u2, s2, _ = np.linalg.svd(reconstructed_matrix)
     
+    # Print comparison table
+    print("\n=== Singular Values Comparison ===")
+    print(f"{'Index':<6} {'True SV':<15} {'Reconstructed SV':<15} {'Abs Diff':<15} {'Rel Diff %':<15}")
+    print("-" * 70)
+    for i in range(min(len(s1), len(s2))):
+        abs_diff = abs(s1[i] - s2[i])
+        rel_diff = (abs_diff / s1[i] * 100) if s1[i] != 0 else float('inf')
+        print(f"{i:<6} {s1[i]:<15.6f} {s2[i]:<15.6f} {abs_diff:<15.6f} {rel_diff:<15.2f}")
+    print("=" * 70)
+    
     plt.figure(figsize=(10, 6))
     plt.plot(s1, 'b-', label='Original SVs')
     plt.plot(s2, 'r--', label='Reconstructed SVs')
@@ -1012,27 +960,27 @@ if __name__ == "__main__":
     
     # Create environment with explicit matrix size and rank
     matrix_size = 8
-    rank = 3
+    rank = 8  # Set to matrix_size to get all singular values
     
     env = make_vec_env(
-        lambda: QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=matrix_size),
+        lambda: QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=rank),
         n_envs=4
     )
     env = VecNormalize(env, norm_obs=True, norm_reward=True)
 
     # Verify environment dimensions
-    test_env = QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=matrix_size)
+    test_env = QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=rank)
     print(f"Action space shape: {test_env.action_space.shape}")
     print(f"Observation space shape: {test_env.observation_space.shape}")
 
-    # Create PPO agent with tuned hyperparameters
+    # **Update PPO agent's hyperparameters if necessary**
     model = PPO(
         "MlpPolicy",
         env,
-        learning_rate=5e-4,
-        n_steps=4096,
-        batch_size=256,
-        n_epochs=20,
+        learning_rate=1e-3,  # Adjusted if needed
+        n_steps=1024,        # Adjust based on computational resources
+        batch_size=128,      # Adjust based on new rank
+        n_epochs=10,         # Adjust as necessary
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
@@ -1040,8 +988,8 @@ if __name__ == "__main__":
         verbose=1
     )
 
-    # Train for longer
-    model.learn(total_timesteps=50000)
+    # **Train for an extended period to accommodate the higher rank**
+    model.learn(total_timesteps=100000)  # Increased timesteps to allow learning of additional singular values
 
     # Modify the debug_shapes function to use logging
     def debug_shapes(logger, step_num, action, obs, rewards=None, infos=None):

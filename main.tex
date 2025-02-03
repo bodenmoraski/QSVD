@@ -1,0 +1,278 @@
+% !TEX TS-program = pdflatex
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{palatino}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins, breakable}
+\usepackage{amsmath, amssymb, microtype}
+\usepackage[svgnames]{xcolor}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{float}
+\usepackage{nicematrix}
+\usepackage[ruled,vlined]{algorithm2e}
+
+% Custom Colors
+\definecolor{thoughtblue}{RGB}{225,238,250}
+\definecolor{questionyellow}{RGB}{255,250,205}
+\definecolor{strategypurple}{RGB}{245,230,255}
+
+% Section Formatting
+\titleformat{\section}{\Large\bfseries\sffamily}{}{0em}{}
+\titleformat{\subsection}{\large\bfseries\sffamily}{}{0em}{}
+\titlespacing*{\section}{0pt}{1.5em}{0.8em}
+\titlespacing*{\subsection}{0pt}{1.2em}{0.6em}
+
+% Thought Process Boxes
+\newtcolorbox{thoughtbox}{
+  colback=thoughtblue,
+  colframe=RoyalBlue,
+  arc=3pt,
+  boxrule=1pt,
+  left=6pt,
+  right=6pt,
+  top=6pt,
+  bottom=6pt,
+  fontupper=\itshape
+}
+
+% Strategy Framework Box
+\newtcolorbox{strategybox}{
+  colback=strategypurple,
+  colframe=DarkOrchid,
+  arc=3pt,
+  boxrule=1pt,
+  left=6pt,
+  right=6pt,
+  top=6pt,
+  bottom=6pt,
+  fontupper=\normalfont
+}
+
+% Question/Note Formatting
+\newcommand{\researchquestion}[1]{%
+  \vspace{0.5em}\noindent%
+  \colorbox{questionyellow}{\parbox{\dimexpr\textwidth-2\fboxsep}{%
+  \textbf{Research Question:} #1}}\vspace{0.5em}%
+}
+
+% Custom Table Formatting
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\renewcommand{\arraystretch}{1.2}
+
+\begin{document}
+
+\begin{center}
+\sffamily
+{\Huge Cabbage Merchant Strategy Analysis}\\[0.5em]
+{\large SPARC Application Thought Journal}\\[1em]
+Boden Moraski | \today
+\end{center}
+
+% Introduction
+\section*{Introduction}
+\begin{thoughtbox}
+"Starting a business as a cabbage merchant involves balancing customer satisfaction, inventory management, and cost control. Let's work through the dynamics to find an optimal strategy."
+\end{thoughtbox}
+
+% Problem Statement
+\section*{Problem Statement}
+Every morning, a customer orders one cabbage. If you accept the order, you promise to deliver within three days for \$4. Failing to deliver results in a refund and an additional \$1 apology. You can also decline orders.
+
+Each night, you can order any number of cabbages from a farmer at \$1 per cabbage. Cabbages arrive after two days. However, farmers might cancel entire orders one day before delivery without a refund. Any remaining cabbages spoil at the end of each day.
+
+Our goal is to determine the best strategy to maximize profit while managing risks associated with order cancellations and spoilage.
+
+% Initial Exploration
+\section*{Initial Exploration}
+\begin{thoughtbox}
+"Let's simplify the situation by ignoring overlapping orders and daily fluctuations initially. We'll focus on the basic profit equation."
+\end{thoughtbox}
+
+\subsection*{Core Assumptions}
+\begin{itemize}[leftmargin=*,label=\color{DarkSlateBlue}\textbullet]
+  \item \textbf{Constant Cancellation Rate}: Probability \( P \) that a farmer cancels an order.
+  \item \textbf{Independent Failures}: Each order cancellation is independent of others.
+  \item \textbf{No Inventory Carryover}: Unsold cabbages spoil daily and cannot be carried over.
+\end{itemize}
+
+\subsection*{Profit Equation Breakdown}
+\begin{equation*}
+\mathbb{E}[\text{Profit}] = \underbrace{4(1-P^k)}_{\text{Revenue}} - 
+\underbrace{k}_{\text{Cost}} - 
+\underbrace{5P^k}_{\text{Penalty}}
+\end{equation*}
+Where:
+\begin{itemize}
+  \item \( k \) = Number of cabbages ordered
+  \item \( P^k \) = Probability that all \( k \) cabbages are canceled
+\end{itemize}
+
+% Algorithm for Order Decision
+\section*{Order Decision Algorithm}
+\begin{thoughtbox}
+"To systematically decide whether to accept or decline an order, we'll develop an algorithm that considers current inventory, cancellation probabilities, and cost factors."
+\end{thoughtbox}
+
+\begin{algorithm}[H]
+\caption{Order Acceptance Decision Algorithm}
+\KwIn{Current Inventory $I$, Cancellation Probability $P$, Current Cost $c$}
+\KwOut{Decision to Accept (Yes/No)}
+\If{$I \geq 1$}{
+    \Return Accept\;
+}
+\Else{
+    Calculate expected profit for accepting: $\mathbb{E}[\text{Profit}_{\text{accept}}] = 4(1-P) - 1 - 5P$\;
+    Calculate expected profit for declining: $\mathbb{E}[\text{Profit}_{\text{decline}}] = 0$\;
+    \If{$\mathbb{E}[\text{Profit}_{\text{accept}}] > \mathbb{E}[\text{Profit}_{\text{decline}}]$}{
+        \Return Accept\;
+    }
+    \Else{
+        \Return Decline\;
+    }
+}
+\end{algorithm}
+
+\subsection*{Weather-Dependent Strategy}
+When weather conditions affect cancellation probabilities, we need a more sophisticated approach:
+
+\begin{algorithm}[H]
+\caption{Weather-Dependent Strategy Algorithm}
+\KwIn{Current Inventory $I$, Cancellation Probability $P$, Weather Condition $W$}
+\KwOut{Decision to Accept (Yes/No)}
+\If{$W = \text{Bad}$}{
+    $P' = f(W)$ \tcp*{Adjust cancellation probability based on weather}
+}
+\Else{
+    $P' = P$\;
+}
+\If{$I \geq 1$}{
+    \Return Accept\;
+}
+\Else{
+    Calculate expected profit for accepting: $\mathbb{E}[\text{Profit}_{\text{accept}}] = 4(1-P') - 1 - 5P'$\;
+    Calculate expected profit for declining: $\mathbb{E}[\text{Profit}_{\text{decline}}] = 0$\;
+    \If{$\mathbb{E}[\text{Profit}_{\text{accept}}] > \mathbb{E}[\text{Profit}_{\text{decline}}]$}{
+        \Return Accept\;
+    }
+    \Else{
+        \Return Decline\;
+    }
+}
+\end{algorithm}
+
+% Strategic Decision Mathematics
+\section*{Strategic Decision Mathematics}
+\begin{thoughtbox}
+"Under what conditions should I order one cabbage versus two? Let's compare the expected profits."
+\end{thoughtbox}
+
+\subsection*{Expected Profit Comparison}
+For a given cancellation probability \( P \):
+\begin{itemize}[label=\color{DarkSlateBlue}\textbullet]
+  \item \( k=1 \): \(\mathbb{E}_1 = 4(1-P) - 1 - 5P = 3 - 9P\)
+  \item \( k=2 \): \(\mathbb{E}_2 = 4(1-P^2) - 2 - 5P^2 = 2 - 9P^2\)
+\end{itemize}
+
+\begin{strategybox}
+\subsubsection*{Determining the Optimal \( k \)}
+To find when ordering two cabbages is better than one:
+\begin{align*}
+2 - 9P^2 &> 3 - 9P \\
+9P^2 - 9P + 1 &< 0 \\
+P &= \frac{9 \pm \sqrt{81 - 36}}{18} = \frac{9 \pm \sqrt{45}}{18} \\
+P &\approx \frac{9 \pm 6.708}{18} \Rightarrow P \approx 0.127,\ 0.873
+\end{align*}
+\end{strategybox}
+
+\subsection*{Profitability Constraints}
+Based on the above calculations:
+\begin{itemize}[label=\color{DarkSlateBlue}\textbullet]
+  \item **Single Order (\( k=1 \))** is profitable if \( P < 0.127 \).
+  \item **Double Order (\( k=2 \))** is profitable if \( 0.127 \leq P < 0.873 \).
+  \item Ordering more than two cabbages may not be profitable within this model.
+\end{itemize}
+
+\subsection*{Numerical Case Studies}
+\begin{table}[H]
+\centering
+\begin{tabularx}{0.95\textwidth}{lYYY}
+\toprule
+\textbf{Scenario} & \( P=0.1 \) & \( P=0.3 \) & \( P=0.5 \) \\
+\midrule
+\( \mathbb{E}_1 \) & \( 3 - 9(0.1) = 2.1 \) & \( 3 - 9(0.3) = 0.3 \) & \( 3 - 9(0.5) = -1.5 \) \\
+\( \mathbb{E}_2 \) & \( 2 - 9(0.1)^2 = 1.91 \) & \( 2 - 9(0.3)^2 = 1.19 \) & \( 2 - 9(0.5)^2 = -0.25 \) \\
+\textbf{Optimal} & k=1 & k=2 & Decline \\
+\bottomrule
+\end{tabularx}
+\caption{Expected Profit Comparison Across Different Cancellation Probabilities}
+\end{table}
+
+\begin{strategybox}
+\subsubsection*{Strategy Decision Rule}
+Based on the probability \( P \), the optimal number of cabbages to order \( k^* \) is:
+\[
+k^* = \begin{cases}
+1 & \text{if } P < 0.127 \text{ (Low Risk)} \\
+2 & \text{if } 0.127 \leq P < 0.471 \text{ (Moderate Risk)} \\
+0 & \text{if } P \geq 0.471 \text{ (High Risk)}
+\end{cases}
+\]
+\end{strategybox}
+
+\subsection*{Sensitivity Analysis}
+Examining how changes in \( P \) affect the expected profit:
+\begin{align*}
+\text{Marginal Benefit} &= \frac{\partial \mathbb{E}}{\partial k} = 4P^k\ln \left(\frac{1}{P}\right) - 1 - 5P^k\ln P \\
+\text{Break-even Point} & \text{ occurs when } 4P^k\ln \left(\frac{1}{P}\right) = 1 + 5P^k\ln P
+\end{align*}
+
+% Phase Transition Matrix
+\subsection*{Phase Transition Matrix}
+\begin{NiceTabular}{|c|c|c|c|}[hvlines]
+\hline
+\RowStyle{\bfseries}Probability Range & Strategy & Revenue Aspect & Risk Aspect \\
+\hline
+$[0, 0.127)$ & Order 1 & $4(1-P)$ & $-9P$ \\
+$[0.127, 0.471)$ & Order 2 & $4(1-P^2)$ & $-9P^2$ \\
+$[0.471, 1]$ & Don't Order & 0 & 0 \\
+\hline
+\end{NiceTabular}
+
+% Strategy Summary
+\section*{Strategy Summary}
+\begin{table}[H]
+\centering
+\begin{tabularx}{0.95\textwidth}{lYY}
+\toprule
+\textbf{Condition} & \textbf{Optimal Strategy} & \textbf{Key Consideration} \\
+\midrule
+Low Risk (\( P < 0.127 \)) & Single Order (\( k=1 \)) & Minimal cost with low risk of cancellation \\
+Moderate Risk (\( 0.127 \leq P < 0.471 \)) & Double Order (\( k=2 \)) & Balancing additional cost against increased reliability \\
+High Risk (\( P \geq 0.471 \)) & Decline Orders & Avoiding losses from high cancellation rates \\
+Correlated Failures & Conditional Acceptance & Incorporate weather monitoring and adjust orders accordingly \\
+\bottomrule
+\end{tabularx}
+\caption{Strategic Decision Matrix for Cabbage Merchant Scenario}
+\end{table}
+
+% Future Research Directions
+\subsection*{Future Research Directions}
+\begin{itemize}[leftmargin=*,label=\color{DarkSlateBlue}\textbullet]
+  \item Explore reinforcement learning techniques for adapting strategies in dynamic environments
+  \item Validate models with real-world data from urban farming operations
+  \item Extend economic models to include risk-transfer instruments like insurance to mitigate potential losses
+\end{itemize}
+
+% Conclusion
+\section*{Conclusion}
+\begin{thoughtbox}
+"After analyzing various strategies and considering factors like cancellation probabilities and weather conditions, we've developed a comprehensive approach to maximize profitability while minimizing risks."
+\end{thoughtbox}
+
+Through the strategic decision rules and adaptive frameworks outlined, a cabbage merchant can effectively balance inventory management with customer satisfaction. By dynamically adjusting orders based on real-time data and weather conditions, it's possible to enhance operational efficiency and respond adeptly to market fluctuations. Future research and real-world validation will further refine these strategies, ensuring sustained success in the competitive market of urban farming.
+
+\end{document}

@@ -50,6 +50,7 @@ class QSVDNoiseEnv(gym.Env):
         self.circuit_depth = circuit_depth
         self.n = M.shape[0]
         self.n_qubits = int(np.ceil(np.log2(self.n)))
+        self.n_qubits = int(np.ceil(np.log2(self.n)))
         
         # Initialize quantum backend
         self.backend = AerSimulator()
@@ -70,7 +71,8 @@ class QSVDNoiseEnv(gym.Env):
         # Print dimensions for debugging
         print(f"Environment dimensions:")
         print(f"Matrix size (n): {self.n}")
-        print(f"Full rank: {self.rank}")
+        print(f"Requested rank: {rank}")
+        print(f"Actual rank used: {self.rank}")
         print(f"Action space dim: {self.action_space.shape}")
         print(f"Observation space dim: {self.observation_space.shape}")
         
@@ -791,7 +793,7 @@ class MetricsTracker:
         ax = axes[0, 1]
         sns.histplot(data=self.metrics['rewards'], ax=ax, bins=30)
         ax.axvline(np.mean(self.metrics['rewards']), color='red', linestyle='--', 
-                   label=f'Mean: {np.mean(self.metrics['rewards']):.4f}')
+                   label=f'Mean: {np.mean(self.metrics["rewards"]):.4f}')
         ax.set_title('Reward Distribution')
         ax.legend()
 
@@ -885,6 +887,16 @@ def plot_singular_values(original_matrix, reconstructed_matrix, save_path=None):
     u1, s1, _ = np.linalg.svd(original_matrix)
     u2, s2, _ = np.linalg.svd(reconstructed_matrix)
     
+    # Print comparison table
+    print("\n=== Singular Values Comparison ===")
+    print(f"{'Index':<6} {'True SV':<15} {'Reconstructed SV':<15} {'Abs Diff':<15} {'Rel Diff %':<15}")
+    print("-" * 70)
+    for i in range(min(len(s1), len(s2))):
+        abs_diff = abs(s1[i] - s2[i])
+        rel_diff = (abs_diff / s1[i] * 100) if s1[i] != 0 else float('inf')
+        print(f"{i:<6} {s1[i]:<15.6f} {s2[i]:<15.6f} {abs_diff:<15.6f} {rel_diff:<15.2f}")
+    print("=" * 70)
+    
     plt.figure(figsize=(10, 6))
     plt.plot(s1, 'b-', label='Original SVs')
     plt.plot(s2, 'r--', label='Reconstructed SVs')
@@ -906,27 +918,27 @@ if __name__ == "__main__":
     
     # Create environment with explicit matrix size and rank
     matrix_size = 8
-    rank = 3
+    rank = 8  # Set to matrix_size to get all singular values
     
     env = make_vec_env(
-        lambda: QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=matrix_size),
+        lambda: QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=rank),
         n_envs=4
     )
     env = VecNormalize(env, norm_obs=True, norm_reward=True)
 
     # Verify environment dimensions
-    test_env = QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=matrix_size)
+    test_env = QSVDNoiseEnv(M=np.random.rand(matrix_size, matrix_size), rank=rank)
     print(f"Action space shape: {test_env.action_space.shape}")
     print(f"Observation space shape: {test_env.observation_space.shape}")
 
-    # Create PPO agent with tuned hyperparameters
+    # **Update PPO agent's hyperparameters if necessary**
     model = PPO(
         "MlpPolicy",
         env,
-        learning_rate=5e-4,
-        n_steps=4096,
-        batch_size=256,
-        n_epochs=20,
+        learning_rate=1e-3,  # Adjusted if needed
+        n_steps=1024,        # Adjust based on computational resources
+        batch_size=128,      # Adjust based on new rank
+        n_epochs=10,         # Adjust as necessary
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
@@ -934,8 +946,8 @@ if __name__ == "__main__":
         verbose=1
     )
 
-    # Train for longer
-    model.learn(total_timesteps=50000)
+    # **Train for an extended period to accommodate the higher rank**
+    model.learn(total_timesteps=100000)  # Increased timesteps to allow learning of additional singular values
 
     # Modify the debug_shapes function to use logging
     def debug_shapes(logger, step_num, action, obs, rewards=None, infos=None):
